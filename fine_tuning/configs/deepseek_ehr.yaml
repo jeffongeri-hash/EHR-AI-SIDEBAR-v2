@@ -1,0 +1,46 @@
+# Fine-tuning config: DeepSeek-R1-Distill-Qwen-1.5B on EHR domain data
+# GPU requirement: ~6GB VRAM
+# Run: python fine_tuning/train.py --config fine_tuning/configs/deepseek_ehr.yaml
+
+base_model: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+output_name: "ehr-deepseek-r1-1.5b-v1"
+output_dir: "./models"
+
+# Dataset
+dataset: "datasets/ehr_train.jsonl"
+dataset_split: "train"
+text_field: "text"
+
+# Training
+num_epochs: 5
+batch_size: 8
+gradient_accumulation_steps: 2
+learning_rate: 0.0002
+warmup_steps: 50
+max_seq_length: 1024
+logging_steps: 10
+save_strategy: "epoch"
+
+# LoRA
+use_lora: true
+lora:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.1
+  target_modules:
+    - q_proj
+    - v_proj
+    - k_proj
+    - o_proj
+  bias: none
+
+# Quantization
+load_in_4bit: true
+bnb_compute_dtype: "float16"
+
+# Hardware
+fp16: true
+gradient_checkpointing: true
+dataloader_num_workers: 0
+
+push_to_hub: false

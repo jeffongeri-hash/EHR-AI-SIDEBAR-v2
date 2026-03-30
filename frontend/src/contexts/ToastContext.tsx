@@ -1,0 +1,78 @@
+import React, { createContext, useContext, useState, useCallback } from 'react'
+import { ToastContainer, Toast, ToastType } from '@/components/Toast'
+
+interface ToastContextType {
+  showToast: (type: ToastType, title: string, message?: string, duration?: number) => void
+  showSuccess: (title: string, message?: string) => void
+  showError: (title: string, message?: string) => void
+  showWarning: (title: string, message?: string) => void
+  showInfo: (title: string, message?: string) => void
+  dismissToast: (id: string) => void
+}
+
+const ToastContext = createContext<ToastContextType | null>(null)
+
+export function useToast() {
+  const context = useContext(ToastContext)
+  if (!context) {
+    throw new Error('useToast must be used within a ToastProvider')
+  }
+  return context
+}
+
+interface ToastProviderProps {
+  children: React.ReactNode
+}
+
+export function ToastProvider({ children }: ToastProviderProps) {
+  const [toasts, setToasts] = useState<Toast[]>([])
+
+  const showToast = useCallback((type: ToastType, title: string, message?: string, duration: number = 5000) => {
+    const id = Date.now().toString()
+    const newToast: Toast = {
+      id,
+      type,
+      title,
+      message,
+      duration: type === 'error' ? 0 : duration // Error toasts stay until dismissed
+    }
+
+    setToasts(prev => [...prev, newToast])
+  }, [])
+
+  const showSuccess = useCallback((title: string, message?: string) => {
+    showToast('success', title, message)
+  }, [showToast])
+
+  const showError = useCallback((title: string, message?: string) => {
+    showToast('error', title, message)
+  }, [showToast])
+
+  const showWarning = useCallback((title: string, message?: string) => {
+    showToast('warning', title, message)
+  }, [showToast])
+
+  const showInfo = useCallback((title: string, message?: string) => {
+    showToast('info', title, message)
+  }, [showToast])
+
+  const dismissToast = useCallback((id: string) => {
+    setToasts(prev => prev.filter(toast => toast.id !== id))
+  }, [])
+
+  const value: ToastContextType = {
+    showToast,
+    showSuccess,
+    showError,
+    showWarning,
+    showInfo,
+    dismissToast
+  }
+
+  return (
+    <ToastContext.Provider value={value}>
+      {children}
+      <ToastContainer toasts={toasts} onDismiss={dismissToast} />
+    </ToastContext.Provider>
+  )
+}

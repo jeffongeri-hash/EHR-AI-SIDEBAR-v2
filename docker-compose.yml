@@ -1,0 +1,111 @@
+version: "3.9"
+
+services:
+  # ── Backend ────────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ehr-ai-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - uploads:/app/uploads
+      - models:/app/models
+      - datasets:/app/datasets
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - HF_TOKEN=${HF_TOKEN:-}
+      - DATABASE_URL=sqlite+aiosqlite:///./ehr_ai.db
+      - DEBUG=${DEBUG:-false}
+    depends_on:
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Frontend ───────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ehr-ai-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # ── Ollama (local LLM) ─────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ehr-ai-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    # GPU support (uncomment for NVIDIA GPUs)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # ── Celery worker (fine-tuning jobs) ──────────────────────────────────────
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ehr-ai-celery
+    # concurrency=1: at most one GPU training job at a time
+    command: celery -A app.workers.celery_app worker --concurrency=1 --loglevel=info -Q fine_tune
+    volumes:
+      - ./backend:/app
+      - uploads:/app/uploads
+      - models:/app/models
+      - datasets:/app/datasets
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - HF_TOKEN=${HF_TOKEN:-}
+      - DATABASE_URL=sqlite+aiosqlite:///./ehr_ai.db
+      - REDIS_URL=redis://redis:6379/0
+      - DEBUG=${DEBUG:-false}
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # Graceful shutdown: allow up to 30 min for an in-progress training job
+    # to finish before the container is force-killed on docker stop
+    stop_grace_period: 30m
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.workers.celery_app", "inspect", "ping", "-d", "celery@$$HOSTNAME"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+
+  # ── Redis (task queue) ─────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: ehr-ai-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  uploads:
+  models:
+  datasets:
+  ollama_data:

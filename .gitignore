@@ -1,0 +1,60 @@
+# Environment — .env is intentionally committed so keys transfer to new machine
+# .env
+.env.local
+# *.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Data & Models (large files)
+uploads/
+models/
+datasets/
+*.bin
+*.safetensors
+*.gguf
+*.ggml
+*.pth
+*.pt
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.docker/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/

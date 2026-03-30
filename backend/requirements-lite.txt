@@ -1,0 +1,18 @@
+# Lightweight requirements for older macOS
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+python-multipart==0.0.6
+aiofiles==23.2.1
+python-dotenv==1.0.0
+
+# Only essential packages
+anthropic==0.7.8
+httpx==0.25.2
+
+# Skip heavy packages that cause issues:
+# - transformers (causes memory issues)
+# - torch (too large for 8GB systems)  
+# - pyarrow (build issues on older macOS)
+# - bitsandbytes (not compatible)
+# - datasets (memory intensive)

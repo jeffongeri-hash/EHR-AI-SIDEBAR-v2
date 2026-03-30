@@ -1,0 +1,63 @@
+{
+  "recommended_models_for_mac": {
+    "ultra_light": {
+      "base_model": "microsoft/DialoGPT-small",
+      "description": "Fastest training, 117M parameters",
+      "memory_usage": "~500MB",
+      "training_time": "15-30 minutes"
+    },
+    "light": {
+      "base_model": "microsoft/DialoGPT-medium", 
+      "description": "Good balance, 345M parameters",
+      "memory_usage": "~1.5GB",
+      "training_time": "30-60 minutes"
+    },
+    "efficient_medical": {
+      "base_model": "microsoft/phi-2",
+      "description": "Best for medical tasks, 2.7B parameters",
+      "memory_usage": "~3GB",
+      "training_time": "1-2 hours"
+    },
+    "medical_specialized": {
+      "base_model": "aaditya/Llama2-7b-chat-finetune-for-medical-chatbot",
+      "description": "Pre-trained on medical data, 7B parameters",
+      "memory_usage": "~8GB with 4-bit quantization",
+      "training_time": "2-4 hours"
+    }
+  },
+  
+  "mac_optimized_training_config": {
+    "base_model": "microsoft/phi-2",
+    "output_model_name": "ehr-phi-medical-mac",
+    "num_epochs": 1,
+    "batch_size": 1,
+    "gradient_accumulation_steps": 8,
+    "max_seq_length": 512,
+    "learning_rate": 2e-4,
+    "use_lora": true,
+    "load_in_4bit": true,
+    "fp16": false,
+    "gradient_checkpointing": true,
+    "lora_config": {
+      "r": 8,
+      "lora_alpha": 16, 
+      "lora_dropout": 0.1,
+      "target_modules": ["q_proj", "v_proj", "k_proj", "o_proj"]
+    }
+  },
+
+  "training_examples": [
+    {
+      "input": "Patient presents with chest pain, what initial assessment should be done?",
+      "output": "For chest pain evaluation: 1) Obtain vital signs and O2 saturation, 2) 12-lead ECG within 10 minutes, 3) Chest X-ray, 4) Cardiac enzymes (troponin), 5) Complete history including onset, quality, radiation, associated symptoms, 6) Physical exam focusing on cardiac and pulmonary systems."
+    },
+    {
+      "input": "How do you interpret elevated troponin levels?",
+      "output": "Elevated troponin indicates cardiac muscle injury. Consider: 1) Myocardial infarction (most common), 2) Myocarditis, 3) Pulmonary embolism, 4) Sepsis, 5) Renal failure, 6) Heart failure exacerbation. Clinical correlation with ECG, symptoms, and imaging is essential for proper diagnosis."
+    },
+    {
+      "input": "What are the contraindications for thrombolytic therapy?",
+      "output": "Absolute contraindications: Prior ICH, structural vascular lesion, recent spinal surgery, severe hypertension >185/110, active bleeding. Relative contraindications: Recent major surgery, pregnancy, advanced age >75, current anticoagulation, recent trauma."
+    }
+  ]
+}
