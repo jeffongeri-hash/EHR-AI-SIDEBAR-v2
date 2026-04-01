@@ -91,29 +91,105 @@ def _clean_medical_text(text: str) -> str:
 
 # ── Image enhancement for medical scans ──────────────────────────────────────
 
+def _upscale_if_needed(img, min_width: int = 1400):
+    """
+    Upscale images that are too small for reliable OCR.
+    Most medical scanners produce 200-300 DPI; fax machines can be as low as 96 DPI.
+    Tesseract accuracy drops significantly below ~200 DPI equivalent.
+    """
+    try:
+        from PIL import Image as PilImage
+        w, h = img.size
+        if w < min_width:
+            scale = min_width / w
+            new_w, new_h = int(w * scale), int(h * scale)
+            logger.debug(f"Upscaling image {w}x{h} → {new_w}x{new_h} (scale {scale:.2f}×)")
+            return img.resize((new_w, new_h), PilImage.LANCZOS)
+    except Exception as exc:
+        logger.debug(f"Upscale failed (using original): {exc}")
+    return img
+
+
+def _denoise_image(img):
+    """
+    Remove salt-and-pepper noise common in faxed and photocopied medical records.
+    Uses median filter — preserves edges better than Gaussian blur.
+    """
+    try:
+        from PIL import ImageFilter
+        return img.filter(ImageFilter.MedianFilter(size=3))
+    except Exception as exc:
+        logger.debug(f"Denoising failed (using original): {exc}")
+    return img
+
+
+def _remove_scanner_borders(img):
+    """
+    Crop black scanner borders that appear when scanning documents smaller than
+    the scanner bed (common with letter-size forms on A4 scanners and vice versa).
+    Finds the bounding box of non-black content and crops to it.
+    """
+    try:
+        from PIL import ImageOps
+        gray = img.convert("L")
+        # Invert so black borders become white, content stays dark
+        inverted = ImageOps.invert(gray)
+        bbox = inverted.getbbox()
+        if bbox:
+            margin = 10  # leave a small margin
+            left = max(0, bbox[0] - margin)
+            top = max(0, bbox[1] - margin)
+            right = min(img.width, bbox[2] + margin)
+            bottom = min(img.height, bbox[3] + margin)
+            cropped = img.crop((left, top, right, bottom))
+            # Only use crop if it removed a meaningful border (>5% of image)
+            area_ratio = (cropped.width * cropped.height) / (img.width * img.height)
+            if area_ratio < 0.95:
+                logger.debug(f"Removed scanner border — {img.size} → {cropped.size}")
+                return cropped
+    except Exception as exc:
+        logger.debug(f"Border removal failed (using original): {exc}")
+    return img
+
+
+def _is_blank_page(img, threshold: float = 0.98) -> bool:
+    """
+    Detect blank or near-blank pages to skip OCR entirely.
+    A page is considered blank if >= threshold fraction of pixels are near-white.
+    """
+    try:
+        from PIL import ImageOps
+        import statistics
+        gray = img.convert("L")
+        pixels = list(gray.getdata())
+        white_count = sum(1 for p in pixels if p > 240)
+        return (white_count / len(pixels)) >= threshold
+    except Exception:
+        return False
+
+
 def _enhance_medical_image(img):
     """
-    Enhance a PIL image for better OCR on medical documents:
-    - Auto-rotate based on Tesseract OSD
-    - Increase contrast and sharpness
-    - Convert to grayscale then back to RGB (removes colour noise)
-    - Optional binarisation for very low-contrast scans
+    Full enhancement pipeline for medical document images:
+    1. Remove scanner borders
+    2. Upscale if resolution is too low
+    3. Denoise (median filter for fax artifacts)
+    4. Grayscale + auto-level histogram
+    5. Double-sharpen for fax/photocopy quality
+    6. Contrast boost
     """
     try:
         from PIL import ImageEnhance, ImageFilter, ImageOps
-        import PIL.Image as PilImage
 
-        # Convert to grayscale for processing, back to RGB for OCR engines
+        img = _remove_scanner_borders(img)
+        img = _upscale_if_needed(img)
+        img = _denoise_image(img)
+
         gray = img.convert("L")
-
-        # Auto-level (stretch histogram)
         gray = ImageOps.autocontrast(gray, cutoff=2)
-
-        # Sharpen
         gray = gray.filter(ImageFilter.SHARPEN)
-        gray = gray.filter(ImageFilter.SHARPEN)  # double sharpen for fax quality
+        gray = gray.filter(ImageFilter.SHARPEN)
 
-        # Enhance contrast
         enhancer = ImageEnhance.Contrast(gray)
         gray = enhancer.enhance(1.8)
 
@@ -186,7 +262,9 @@ class DocumentProcessor:
                 pages = self._process_docx(path, ocr_engine, enhance_images, languages, page_errors)
             elif suffix in _IMAGE_SUFFIXES:
                 # Multi-page TIFF handled inside _process_image
-                pages = self._process_image(path, ocr_engine, enhance_images, languages, page_errors)
+                pages = self._process_image(
+                    path, ocr_engine, enhance_images, languages, page_errors, extract_tables
+                )
             else:
                 return self._fail(doc_id, path,
                                   f"Unsupported file type '{suffix}'. "
@@ -635,15 +713,16 @@ class DocumentProcessor:
 
     # ── Image pipeline ────────────────────────────────────────────────────────
 
-    def _process_image(self, path, ocr_engine, enhance, languages, page_errors):
-        """Process image files — including multi-page TIFF."""
+    def _process_image(self, path, ocr_engine, enhance, languages, page_errors,
+                       extract_tables: bool = True):
+        """Process image files — including multi-page TIFF and JPEG."""
         try:
             from PIL import Image as PilImage
             img = PilImage.open(path)
         except Exception as exc:
             return [self._error_page(0, f"Cannot open image: {type(exc).__name__}: {exc}")]
 
-        # Multi-page TIFF
+        # Collect all frames (multi-page TIFF or single JPEG/PNG)
         frames: list = []
         try:
             while True:
@@ -652,20 +731,32 @@ class DocumentProcessor:
         except EOFError:
             pass
         except Exception:
-            # Not a multi-page image — treat as single frame
             if not frames:
                 frames = [img.convert("RGB")]
 
         pages = []
         for frame_idx, frame in enumerate(frames):
-            page = self._ocr_image_frame(frame, frame_idx, ocr_engine, enhance, languages)
+            page = self._ocr_image_frame(
+                frame, frame_idx, ocr_engine, enhance, languages, extract_tables=extract_tables
+            )
             pages.append(page)
         return pages
 
     def _ocr_image_frame(self, img, frame_idx: int, ocr_engine, enhance, languages,
-                          retry: int = 0) -> DocumentPage:
-        """OCR a single image frame with enhancement and retry."""
+                          retry: int = 0, extract_tables: bool = True) -> DocumentPage:
+        """OCR a single image frame with full medical preprocessing and table extraction."""
         try:
+            # Blank page check — skip expensive OCR entirely
+            if _is_blank_page(img):
+                logger.debug(f"Frame {frame_idx + 1} detected as blank — skipping OCR")
+                return DocumentPage(
+                    page_number=frame_idx + 1,
+                    width=float(img.width),
+                    height=float(img.height),
+                    raw_text="",
+                    confidence=1.0,
+                )
+
             if enhance:
                 img = _enhance_medical_image(img)
             img, rotation = _auto_rotate(img)
@@ -679,7 +770,9 @@ class DocumentProcessor:
             if conf < _MIN_CONFIDENCE and retry < _MAX_RETRIES:
                 logger.info(f"Image frame {frame_idx + 1} low confidence ({conf:.2f}), "
                             f"retrying with {alt_engine.value}")
-                return self._ocr_image_frame(img, frame_idx, alt_engine, True, languages, retry + 1)
+                return self._ocr_image_frame(
+                    img, frame_idx, alt_engine, True, languages, retry + 1, extract_tables
+                )
 
             try:
                 regions = self.layout_svc.analyze_image_layout(img, frame_idx)
@@ -688,12 +781,20 @@ class DocumentProcessor:
             except Exception as exc:
                 logger.debug(f"Layout analysis failed (non-fatal): {exc}")
 
+            # Table extraction from image — works for JPEG, PNG, TIFF, etc.
+            tables: list[Table] = []
+            if extract_tables:
+                tables = self._extract_image_tables(img, frame_idx)
+                if tables:
+                    logger.info(f"Frame {frame_idx + 1}: extracted {len(tables)} table(s) "
+                                f"({sum(t.rows for t in tables)} rows total)")
+
             return DocumentPage(
                 page_number=frame_idx + 1,
                 width=float(img.width),
                 height=float(img.height),
                 text_blocks=blocks,
-                tables=[],
+                tables=tables,
                 raw_text=_clean_medical_text(text),
                 confidence=conf,
             )
@@ -703,10 +804,128 @@ class DocumentProcessor:
                 alt = OCREngine.TESSERACT if retry % 2 == 0 else OCREngine.EASYOCR
                 logger.warning(f"Image frame {frame_idx + 1} failed ({exc}), "
                                f"retry #{retry + 1} with {alt.value}")
-                return self._ocr_image_frame(img, frame_idx, alt, True, languages, retry + 1)
+                return self._ocr_image_frame(
+                    img, frame_idx, alt, True, languages, retry + 1, extract_tables
+                )
             return self._error_page(frame_idx, f"{type(exc).__name__}: {exc}")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_image_tables(img, page_idx: int = 0) -> list[Table]:
+        """
+        Detect and extract tables from images (JPEG, PNG, TIFF, etc.) using
+        Tesseract word-level bounding boxes.
+
+        Algorithm:
+          1. Get all word bboxes + text from tesseract
+          2. Cluster words into rows by y-coordinate proximity
+          3. Within each row, sort words by x-coordinate
+          4. If at least 3 rows share the same column count → treat as table
+          5. Build Table objects with proper row/col indexing
+
+        This reliably captures:
+          - Lab result panels (test | value | unit | reference range)
+          - Medication tables (drug | dose | frequency | route)
+          - Vital sign grids
+          - Insurance/billing tables
+        """
+        tables: list[Table] = []
+        try:
+            import pytesseract
+            data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+        except Exception as exc:
+            logger.debug(f"Table detection via tesseract skipped: {exc}")
+            return tables
+
+        try:
+            # Collect valid word entries
+            words = []
+            n = len(data["text"])
+            for i in range(n):
+                text = str(data["text"][i]).strip()
+                conf = int(data["conf"][i])
+                if not text or conf < 30:
+                    continue
+                words.append({
+                    "text": text,
+                    "x": data["left"][i],
+                    "y": data["top"][i],
+                    "w": data["width"][i],
+                    "h": data["height"][i],
+                    "cx": data["left"][i] + data["width"][i] // 2,
+                    "cy": data["top"][i] + data["height"][i] // 2,
+                })
+
+            if len(words) < 4:
+                return tables
+
+            # Cluster words into rows (words within 12px vertically = same row)
+            words_sorted = sorted(words, key=lambda w: w["cy"])
+            rows: list[list[dict]] = []
+            current_row: list[dict] = [words_sorted[0]]
+            for word in words_sorted[1:]:
+                if abs(word["cy"] - current_row[-1]["cy"]) <= 12:
+                    current_row.append(word)
+                else:
+                    rows.append(sorted(current_row, key=lambda w: w["cx"]))
+                    current_row = [word]
+            rows.append(sorted(current_row, key=lambda w: w["cx"]))
+
+            if len(rows) < 3:
+                return tables
+
+            # Find the most common column count — if ≥3 rows share it, it's a table
+            from collections import Counter
+            col_counts = Counter(len(r) for r in rows)
+            dominant_cols, freq = col_counts.most_common(1)[0]
+
+            if dominant_cols < 2 or freq < 3:
+                return tables  # not enough structure to be a table
+
+            # Keep only rows that match the dominant column count
+            table_rows = [r for r in rows if len(r) == dominant_cols]
+
+            cells: list[TableCell] = []
+            for r_idx, row in enumerate(table_rows):
+                for c_idx, word in enumerate(row):
+                    cells.append(TableCell(
+                        text=word["text"],
+                        row=r_idx,
+                        col=c_idx,
+                        bbox=BoundingBox(
+                            x=float(word["x"]),
+                            y=float(word["y"]),
+                            width=float(word["w"]),
+                            height=float(word["h"]),
+                            page=page_idx,
+                        ),
+                    ))
+
+            if cells:
+                all_x = [w["x"] for r in table_rows for w in r]
+                all_y = [w["y"] for r in table_rows for w in r]
+                all_x2 = [w["x"] + w["w"] for r in table_rows for w in r]
+                all_y2 = [w["y"] + w["h"] for r in table_rows for w in r]
+                tables.append(Table(
+                    cells=cells,
+                    rows=len(table_rows),
+                    cols=dominant_cols,
+                    bbox=BoundingBox(
+                        x=float(min(all_x)),
+                        y=float(min(all_y)),
+                        width=float(max(all_x2) - min(all_x)),
+                        height=float(max(all_y2) - min(all_y)),
+                        page=page_idx,
+                    ),
+                    page=page_idx,
+                ))
+                logger.debug(f"Detected table: {len(table_rows)} rows × {dominant_cols} cols")
+
+        except Exception as exc:
+            logger.debug(f"Table structure analysis failed: {exc}")
+
+        return tables
 
     @staticmethod
     def _error_page(page_idx: int, error: str) -> DocumentPage:
