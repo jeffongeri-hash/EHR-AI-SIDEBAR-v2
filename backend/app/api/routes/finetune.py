@@ -1,290 +1,446 @@
 """
-Fine-tuning API routes for TinyLlama medical specialization
-"""
+Fine-tuning API Routes
+======================
+Endpoints for in-app LoRA/QLoRA fine-tuning of local models.
+No Google Notebook or Vertex AI — everything runs locally.
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
-from typing import List, Dict, Any, Optional
+Models supported: TinyLlama, DeepSeek-R1 1.5B, Phi-3-mini, Mistral-7B (and any HF model).
+"""
+from __future__ import annotations
+
+# ── stdlib (must be at top!) ────────────────────────────────────────────────────
+import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from app.services.tinyllama_service import tinyllama_service
-from app.models.schemas import (
-    FineTuneStatus,
-    ModelInfo,
-    ModelProvider
-)
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-logger = logging.getLogger(__name__)
+from app.services.local_model_service import (
+    local_model_service,
+    MODEL_CATALOGUE,
+    TrainProgress,
+)
+from app.models.schemas import FineTuneStatus, ModelInfo, ModelProvider
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/finetune", tags=["fine-tuning"])
 
-# ── Schemas ────────────────────────────────────────────────────────────────────
 
-class FineTuningRequest(BaseModel):
+# ── Request / response schemas ───────────────────────────────────────────────────
+
+class FineTuneRequest(BaseModel):
     training_data: List[Dict[str, str]]
-    model_name: str = "TinyLlama-1.1B-Chat"
+    base_model: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     learning_rate: float = 2e-4
     num_epochs: int = 3
     batch_size: int = 1
+    max_seq_length: int = 512
+    gradient_accumulation_steps: int = 8
+    lora_r: int = 8
+    lora_alpha: int = 16
+    load_in_4bit: bool = True
 
-class FineTuningStatus(BaseModel):
+
+class FineTuneStatusOut(BaseModel):
     job_id: str
-    status: FineTuneStatus
+    status: str
     progress: float = 0.0
-    model_name: str
+    base_model: str
     created_at: str
     completed_at: Optional[str] = None
     error_message: Optional[str] = None
+    output_path: Optional[str] = None
 
-class FineTuningResponse(BaseModel):
+
+class FineTuneResponse(BaseModel):
     success: bool
     job_id: str
     message: str
-    status: FineTuningStatus
+    status: FineTuneStatusOut
+
+
+# ── In-memory job tracker ────────────────────────────────────────────────────
+
+_jobs: Dict[str, Dict[str, Any]] = {}      # job_id -> state
+_progress_queues: Dict[str, asyncio.Queue] = {}   # job_id -> SSE queue
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 @router.get("/models")
 async def list_fine_tunable_models() -> Dict[str, Any]:
-    """List available models for fine-tuning"""
-    if not tinyllama_service.is_available():
-        await tinyllama_service.initialize()
-    
-    models = tinyllama_service.get_model_info()
-    
+    """List all models that can be fine-tuned locally."""
+    models = []
+    for alias, meta in MODEL_CATALOGUE.items():
+        models.append({
+            "alias": alias,
+            "hf_id": meta["hf_id"],
+            "display_name": meta["display_name"],
+            "size_gb": meta["size_gb"],
+            "min_ram_gb": meta["min_ram_gb"],
+            "context_length": meta["context_length"],
+            "description": meta["description"],
+            "fine_tunable": meta["fine_tunable"],
+        })
     return {
         "success": True,
-        "models": [
-            {
-                "name": "TinyLlama-1.1B-Chat",
-                "provider": "tinyllama",
-                "size_gb": 2.2,
-                "parameters": "1.1B",
-                "fine_tunable": True,
-                "description": "Lightweight chat model perfect for medical fine-tuning"
-            }
-        ],
-        "current_model": models
+        "models": models,
+        "current_model": local_model_service.get_info(),
     }
 
-@router.post("/start")
-async def start_fine_tuning(request: FineTuningRequest) -> FineTuningResponse:
-    """Start fine-tuning with medical data"""
+
+@router.post("/start", response_model=FineTuneResponse)
+async def start_fine_tuning(request: FineTuneRequest) -> FineTuneResponse:
+    """Start a LoRA fine-tuning job asynchronously."""
+    if not request.training_data:
+        raise HTTPException(status_code=400, detail="training_data is required")
+
+    # Validate examples
+    valid = []
+    for i, item in enumerate(request.training_data):
+        has_qa = "question" in item and "answer" in item
+        has_io = "input" in item and "output" in item
+        has_ins = "instruction" in item and "output" in item
+        if not (has_qa or has_io or has_ins):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Item {i}: must have question/answer, input/output, or instruction/output keys",
+            )
+        valid.append(item)
+
+    job_id = f"ft-{int(datetime.now(timezone.utc).timestamp())}"
+    created_at = _now_iso()
+
+    _jobs[job_id] = {
+        "job_id": job_id,
+        "status": "training",
+        "progress": 0.0,
+        "base_model": request.base_model,
+        "created_at": created_at,
+        "completed_at": None,
+        "error_message": None,
+        "output_path": None,
+    }
+    _progress_queues[job_id] = asyncio.Queue(maxsize=500)
+
+    # Launch fine-tuning in background
+    asyncio.create_task(_run_fine_tune_job(job_id, valid, request))
+
+    status_out = FineTuneStatusOut(
+        job_id=job_id, status="training", progress=0.0,
+        base_model=request.base_model, created_at=created_at,
+    )
+    return FineTuneResponse(
+        success=True, job_id=job_id,
+        message=f"Fine-tuning started for {request.base_model}",
+        status=status_out,
+    )
+
+
+async def _run_fine_tune_job(
+    job_id: str,
+    examples: List[Dict[str, str]],
+    request: FineTuneRequest,
+):
+    """Background task that runs fine-tuning and posts progress updates."""
+    q = _progress_queues.get(job_id)
+    job = _jobs.get(job_id)
+    if q is None or job is None:
+        return
+
+    def _cb(prog: TrainProgress):
+        job["progress"] = prog.progress_pct
+        try:
+            q.put_nowait({
+                "type": "progress",
+                "progress": prog.progress_pct,
+                "epoch": prog.epoch,
+                "step": prog.step,
+                "loss": prog.loss,
+                "log": prog.log_line,
+            })
+        except asyncio.QueueFull:
+            pass
+
     try:
-        # Validate training data
-        if not request.training_data:
-            raise HTTPException(status_code=400, detail="Training data is required")
-        
-        # Validate data format
-        for i, item in enumerate(request.training_data):
-            if not all(key in item for key in ["question", "answer"]) and not all(key in item for key in ["input", "output"]):
-                raise HTTPException(
-                    status_code=400, 
-                    detail=f"Training item {i} must contain 'question'/'answer' or 'input'/'output' fields"
-                )
-        
-        # Initialize TinyLlama if needed
-        if not tinyllama_service.is_available():
-            logger.info("Initializing TinyLlama for fine-tuning...")
-            if not await tinyllama_service.initialize():
-                raise HTTPException(status_code=500, detail="Failed to initialize TinyLlama model")
-        
-        # Prepare training dataset
-        dataset = await tinyllama_service.prepare_fine_tuning_data(request.training_data)
-        logger.info(f"Prepared dataset with {len(dataset)} training examples")
-        
-        # Start fine-tuning
-        job_id = f"ft-{tinyllama_service.config.model_name.replace('/', '-')}-{int(datetime.now().timestamp())}"
-        logger.info(f"Starting fine-tuning job {job_id}")
-        
-        # Run fine-tuning (in background - simplified for demo)
-        success = await tinyllama_service.start_fine_tuning(
-            training_data=dataset,
-            learning_rate=request.learning_rate,
+        output_path = await local_model_service.fine_tune(
+            examples=examples,
+            model_id=request.base_model,
             num_epochs=request.num_epochs,
-            batch_size=request.batch_size
+            batch_size=request.batch_size,
+            learning_rate=request.learning_rate,
+            max_seq_length=request.max_seq_length,
+            gradient_accumulation_steps=request.gradient_accumulation_steps,
+            lora_r=request.lora_r,
+            lora_alpha=request.lora_alpha,
+            load_in_4bit=request.load_in_4bit,
+            progress_callback=_cb,
         )
-        
-        if success:
-            status = FineTuningStatus(
-                job_id=job_id,
-                status=FineTuneStatus.COMPLETED,
-                progress=100.0,
-                model_name=request.model_name,
-                created_at=datetime.now().isoformat(),
-                completed_at=datetime.now().isoformat()
-            )
-            
-            return FineTuningResponse(
-                success=True,
-                job_id=job_id,
-                message="Fine-tuning completed successfully! Medical model is now available.",
-                status=status
-            )
-        else:
-            raise HTTPException(status_code=500, detail="Fine-tuning failed")
-            
-    except Exception as e:
-        logger.error(f"Fine-tuning error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        job["status"] = "completed"
+        job["progress"] = 100.0
+        job["output_path"] = output_path
+        job["completed_at"] = _now_iso()
+        q.put_nowait({"type": "done", "progress": 100.0, "output_path": output_path})
+        logger.info(f"Job {job_id} completed. Model saved to {output_path}")
+    except Exception as exc:
+        err = str(exc)
+        logger.error(f"Fine-tune job {job_id} failed: {err}")
+        job["status"] = "failed"
+        job["error_message"] = err
+        job["completed_at"] = _now_iso()
+        try:
+            q.put_nowait({"type": "error", "message": err})
+        except asyncio.QueueFull:
+            pass
+
+
+@router.get("/progress/{job_id}")
+async def stream_progress(job_id: str):
+    """
+    SSE endpoint — streams training progress in real time.
+    Connect with:  EventSource('/api/finetune/progress/{job_id}')
+    Each event is a JSON object with keys: type, progress, epoch, step, loss, log.
+    """
+    if job_id not in _jobs:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+    job = _jobs[job_id]
+    q = _progress_queues.get(job_id)
+
+    async def event_generator():
+        # If job already done, send final state immediately
+        if job["status"] in ("completed", "failed"):
+            payload = json.dumps({
+                "type": "done" if job["status"] == "completed" else "error",
+                "progress": job["progress"],
+                "output_path": job.get("output_path"),
+                "message": job.get("error_message", ""),
+            })
+            yield f"data: {payload}\n\n"
+            return
+
+        # Stream live events from queue
+        while True:
+            try:
+                event = await asyncio.wait_for(q.get(), timeout=30.0)
+            except asyncio.TimeoutError:
+                # Keep-alive ping
+                yield "data: {\"type\": \"ping\"}\n\n"
+                continue
+
+            yield f"data: {json.dumps(event)}\n\n"
+
+            if event.get("type") in ("done", "error"):
+                break
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/status/{job_id}")
+async def get_job_status(job_id: str) -> Dict[str, Any]:
+    """Poll training job status."""
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    return {"success": True, **job}
+
+
+@router.get("/jobs")
+async def list_jobs() -> Dict[str, Any]:
+    """List all fine-tuning jobs."""
+    return {"success": True, "jobs": list(_jobs.values())}
+
+
+@router.get("/status")
+async def model_status() -> Dict[str, Any]:
+    """Current model load status and fine-tuned adapter info."""
+    info = local_model_service.get_info()
+    ft_models = local_model_service.list_fine_tuned_models()
+    return {
+        "success": True,
+        "model_info": info,
+        "fine_tuned_models": ft_models,
+        "fine_tuning_available": info["hf_available"] and info["torch_available"],
+        "peft_available": info["peft_available"],
+        "bnb_4bit_available": info["bnb_4bit_available"],
+    }
+
+
+@router.post("/load-model")
+async def load_model(model_id: str) -> Dict[str, Any]:
+    """
+    Load a specific model into memory.
+    model_id can be an alias ('tinyllama', 'deepseek-1.5b', 'phi3-mini', 'mistral-7b')
+    or a full HuggingFace model ID.
+    """
+    success = await local_model_service.load_model(model_id)
+    if not success:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to load model '{model_id}'. "
+                   f"Check that transformers and torch are installed and you have enough RAM.",
+        )
+    return {
+        "success": True,
+        "message": f"Model loaded: {local_model_service._active_model_id}",
+        "model_info": local_model_service.get_info(),
+    }
+
 
 @router.post("/upload-dataset")
-async def upload_training_dataset(
+async def upload_dataset(
     file: UploadFile = File(...),
-    description: str = Form("")
+    description: str = Form(""),
 ) -> Dict[str, Any]:
-    """Upload a training dataset file (JSON/JSONL)"""
+    """Upload a JSON or JSONL training dataset file."""
+    if not (file.filename or "").endswith((".json", ".jsonl")):
+        raise HTTPException(status_code=400, detail="File must be .json or .jsonl")
+
+    content = await file.read()
     try:
-        # Validate file type
-        if not file.filename.endswith(('.json', '.jsonl')):
-            raise HTTPException(status_code=400, detail="File must be .json or .jsonl format")
-        
-        # Read file content
-        content = await file.read()
-        text_content = content.decode('utf-8')
-        
-        # Parse data
-        training_data = []
-        if file.filename.endswith('.jsonl'):
-            # JSONL format - one JSON object per line
-            for line in text_content.strip().split('\n'):
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="File must be UTF-8 encoded")
+
+    training_data: List[Dict] = []
+    try:
+        if (file.filename or "").endswith(".jsonl"):
+            for line in text.strip().splitlines():
                 if line.strip():
                     training_data.append(json.loads(line))
         else:
-            # JSON format
-            data = json.loads(text_content)
-            if isinstance(data, list):
-                training_data = data
-            else:
-                training_data = [data]
-        
-        # Validate data format
-        processed_count = 0
-        for item in training_data:
-            if isinstance(item, dict) and (
-                ("question" in item and "answer" in item) or
-                ("input" in item and "output" in item) or
-                ("instruction" in item and "response" in item)
-            ):
-                processed_count += 1
-        
-        if processed_count == 0:
-            raise HTTPException(
-                status_code=400, 
-                detail="No valid training examples found. Each item should have question/answer, input/output, or instruction/response fields."
-            )
-        
-        # Save dataset temporarily
-        dataset_dir = Path("./models/datasets")
-        dataset_dir.mkdir(parents=True, exist_ok=True)
-        dataset_path = dataset_dir / f"uploaded_{file.filename}"
-        
-        with open(dataset_path, 'w') as f:
-            json.dump(training_data, f, indent=2)
-        
-        return {
-            "success": True,
-            "message": f"Dataset uploaded successfully",
-            "filename": file.filename,
-            "total_examples": len(training_data),
-            "valid_examples": processed_count,
-            "dataset_path": str(dataset_path),
-            "description": description
-        }
-        
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON format: {e}")
-    except Exception as e:
-        logger.error(f"Dataset upload error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+            parsed = json.loads(text)
+            training_data = parsed if isinstance(parsed, list) else [parsed]
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}")
 
-@router.get("/datasets")
-async def list_uploaded_datasets() -> Dict[str, Any]:
-    """List uploaded training datasets"""
-    try:
-        dataset_dir = Path("./models/datasets")
-        if not dataset_dir.exists():
-            return {"success": True, "datasets": []}
-        
-        datasets = []
-        for file_path in dataset_dir.glob("*.json"):
-            try:
-                with open(file_path, 'r') as f:
-                    data = json.load(f)
-                
-                datasets.append({
-                    "filename": file_path.name,
-                    "size_mb": round(file_path.stat().st_size / 1024 / 1024, 2),
-                    "examples_count": len(data) if isinstance(data, list) else 1,
-                    "created_at": datetime.fromtimestamp(file_path.stat().st_ctime).isoformat(),
-                    "path": str(file_path)
-                })
-            except Exception as e:
-                logger.warning(f"Could not read dataset {file_path}: {e}")
-        
-        return {
-            "success": True,
-            "datasets": sorted(datasets, key=lambda x: x["created_at"], reverse=True)
-        }
-        
-    except Exception as e:
-        logger.error(f"List datasets error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    valid_count = sum(
+        1 for item in training_data
+        if isinstance(item, dict) and (
+            ("question" in item and "answer" in item)
+            or ("input" in item and "output" in item)
+            or ("instruction" in item and "output" in item)
+        )
+    )
 
-@router.get("/status")
-async def get_fine_tuning_status() -> Dict[str, Any]:
-    """Get current fine-tuning status and model information"""
-    try:
-        model_info = tinyllama_service.get_model_info()
-        
-        return {
-            "success": True,
-            "model_info": model_info,
-            "fine_tuning_available": tinyllama_service.is_available(),
-            "has_fine_tuned_model": model_info.get("has_fine_tuned", False),
-            "cache_dir": model_info.get("cache_dir", ""),
-            "hf_available": model_info.get("hf_available", False)
-        }
-        
-    except Exception as e:
-        logger.error(f"Status check error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    if valid_count == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No valid examples found. Each item must have "
+                   "question/answer, input/output, or instruction/output.",
+        )
 
-@router.post("/sample-data")
-async def generate_sample_medical_data() -> Dict[str, Any]:
-    """Generate sample medical training data for testing"""
-    sample_data = [
-        {
-            "question": "What are the symptoms of pneumonia?",
-            "answer": "Common symptoms of pneumonia include: fever, chills, cough with phlegm or pus, shortness of breath, chest pain when breathing or coughing, nausea, vomiting, diarrhea, fatigue, and confusion (especially in older adults). Seek medical attention if symptoms persist or worsen."
-        },
-        {
-            "question": "How is diabetes diagnosed?",
-            "answer": "Diabetes is diagnosed through blood tests including: Fasting plasma glucose ≥126 mg/dL, Random plasma glucose ≥200 mg/dL with symptoms, Hemoglobin A1c ≥6.5%, or 2-hour glucose ≥200 mg/dL during oral glucose tolerance test. Diagnosis should be confirmed with repeat testing."
-        },
-        {
-            "question": "What should I do for a patient with chest pain?",
-            "answer": "For chest pain assessment: 1) Check vital signs and obtain ECG immediately, 2) Assess pain characteristics (location, quality, radiation, triggers), 3) Order cardiac enzymes (troponin), 4) Consider chest X-ray, 5) Provide oxygen if SpO2 <94%, 6) Prepare for emergency intervention if acute MI suspected, 7) Monitor continuously."
-        },
-        {
-            "question": "What are the normal vital signs for adults?",
-            "answer": "Normal adult vital signs: Heart rate 60-100 bpm, Blood pressure <120/80 mmHg (normal), Respiratory rate 12-20 breaths/min, Temperature 97-99°F (36-37°C), Oxygen saturation >95% on room air. Values may vary based on age, fitness level, and medical conditions."
-        },
-        {
-            "question": "How do you interpret a CBC with differential?",
-            "answer": "CBC interpretation includes: WBC count (4.5-11.0 K/µL) for infection/inflammation, RBC count and hemoglobin for anemia, Platelet count (150-450 K/µL) for bleeding risk, MCV for anemia type classification, and differential for specific white cell abnormalities. Always correlate with clinical presentation."
-        }
-    ]
-    
+    dataset_dir = Path("./models/datasets")
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    save_path = dataset_dir / f"uploaded_{file.filename}"
+    save_path.write_text(json.dumps(training_data, indent=2, ensure_ascii=False))
+
     return {
         "success": True,
-        "message": "Sample medical training data generated",
-        "data": sample_data,
-        "count": len(sample_data),
-        "description": "Sample medical Q&A data for fine-tuning demonstration"
+        "filename": file.filename,
+        "total_examples": len(training_data),
+        "valid_examples": valid_count,
+        "dataset_path": str(save_path),
+        "description": description,
     }
 
-# Import datetime for timestamps
-from datetime import datetime
+
+@router.get("/datasets")
+async def list_datasets() -> Dict[str, Any]:
+    """List uploaded training datasets."""
+    dataset_dir = Path("./models/datasets")
+    if not dataset_dir.exists():
+        return {"success": True, "datasets": []}
+
+    datasets = []
+    for fp in sorted(dataset_dir.glob("*.json*"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            count = sum(1 for _ in fp.open())
+            datasets.append({
+                "filename": fp.name,
+                "size_mb": round(fp.stat().st_size / 1e6, 2),
+                "examples_count": count,
+                "created_at": datetime.fromtimestamp(
+                    fp.stat().st_ctime, tz=timezone.utc
+                ).isoformat(),
+                "path": str(fp),
+            })
+        except Exception:
+            pass
+
+    return {"success": True, "datasets": datasets}
+
+
+@router.post("/sample-data")
+async def sample_medical_data() -> Dict[str, Any]:
+    """Return built-in sample medical Q&A data for testing."""
+    data = [
+        {
+            "instruction": "What are the symptoms of pneumonia?",
+            "output": (
+                "Common symptoms: fever, chills, cough with phlegm, shortness of breath, "
+                "chest pain when breathing, fatigue, and confusion in older adults. "
+                "Seek medical attention if symptoms persist or worsen."
+            ),
+        },
+        {
+            "instruction": "How is type 2 diabetes diagnosed?",
+            "output": (
+                "Diagnosed by: Fasting glucose ≥126 mg/dL, Random glucose ≥200 mg/dL "
+                "with symptoms, HbA1c ≥6.5%, or 2-hr glucose ≥200 mg/dL on OGTT. "
+                "Confirm with repeat testing."
+            ),
+        },
+        {
+            "instruction": "What should I do for a patient presenting with chest pain?",
+            "output": (
+                "1) Check vitals and ECG immediately. 2) Assess pain (location, radiation, "
+                "quality). 3) Order troponin. 4) CXR. 5) Oxygen if SpO2 <94%. "
+                "6) Prepare for emergency intervention if acute MI suspected. 7) Continuous monitoring."
+            ),
+        },
+        {
+            "instruction": "What are normal adult vital signs?",
+            "output": (
+                "HR 60–100 bpm, BP <120/80 mmHg (normal), RR 12–20/min, "
+                "Temp 97–99°F (36–37°C), SpO2 >95% on room air."
+            ),
+        },
+        {
+            "instruction": "How do you interpret a CBC with differential?",
+            "output": (
+                "WBC 4.5–11.0 K/µL (infection/inflammation marker), Hgb for anemia, "
+                "Platelets 150–450 K/µL (bleeding risk), MCV classifies anemia type, "
+                "differential for specific WBC abnormalities. Always correlate with clinical picture."
+            ),
+        },
+        {
+            "instruction": "Summarise this clinical note: Patient 65M, HTN/DM2, presents with "
+                           "crushing chest pain radiating to left arm. ECG: ST elevation II/III/aVF. "
+                           "Troponin 2.1 ng/mL.",
+            "output": (
+                "65M with HTN/DM2 presenting with acute inferior STEMI "
+                "(ST elevation leads II/III/aVF, troponin 2.1). "
+                "Urgent cath lab activation indicated."
+            ),
+        },
+    ]
+    return {
+        "success": True,
+        "data": data,
+        "count": len(data),
+        "description": "Built-in medical Q&A examples for fine-tuning demonstration",
+    }
