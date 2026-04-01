@@ -168,6 +168,418 @@ def _is_blank_page(img, threshold: float = 0.98) -> bool:
         return False
 
 
+# ── Multi-column reading order ────────────────────────────────────────────────
+
+def _detect_column_boundaries(img, min_gap_frac: float = 0.025) -> list[tuple[int, int]]:
+    """
+    Detect vertical column separators using a projection profile.
+
+    For each x-position, count how many dark (text) pixels exist in that
+    vertical strip.  A sustained low-density strip = column gap.
+
+    Returns list of (x_start, x_end) column regions, left to right.
+    Falls back to [(0, width)] for single-column pages.
+    """
+    try:
+        width, height = img.size
+        gray = img.convert("L")
+        pixels = list(gray.getdata())
+
+        # Vertical projection: count dark pixels per x column
+        dark_counts: list[int] = []
+        for x in range(width):
+            col = [pixels[y * width + x] for y in range(height)]
+            dark_counts.append(sum(1 for p in col if p < 140))
+
+        # Smooth with a moving average (window = ~1% of width)
+        win = max(5, width // 80)
+        smoothed: list[float] = []
+        for i in range(width):
+            s = max(0, i - win // 2)
+            e = min(width, i + win // 2 + 1)
+            smoothed.append(sum(dark_counts[s:e]) / (e - s))
+
+        # A gap must have < 3% of average column density
+        avg_density = sum(smoothed) / width if width else 1
+        gap_threshold = avg_density * 0.12
+        min_gap_w = max(8, int(width * min_gap_frac))
+        min_col_w = int(width * 0.18)   # ignore very thin slivers
+
+        # Collect gap spans
+        gaps: list[tuple[int, int]] = []
+        in_gap = False
+        gap_start = 0
+        for x, val in enumerate(smoothed):
+            if val <= gap_threshold:
+                if not in_gap:
+                    in_gap, gap_start = True, x
+            else:
+                if in_gap:
+                    if x - gap_start >= min_gap_w:
+                        gaps.append((gap_start, x))
+                    in_gap = False
+        if in_gap and width - gap_start >= min_gap_w:
+            gaps.append((gap_start, width))
+
+        if not gaps:
+            return [(0, width)]
+
+        # Build column regions from gaps
+        cols: list[tuple[int, int]] = []
+        prev = 0
+        for gs, ge in gaps:
+            mid = (gs + ge) // 2
+            if mid - prev >= min_col_w:
+                cols.append((prev, mid))
+            prev = mid
+        if width - prev >= min_col_w:
+            cols.append((prev, width))
+
+        return cols if len(cols) > 1 else [(0, width)]
+
+    except Exception as exc:
+        logger.debug(f"Column detection failed: {exc}")
+        return [(0, width)]
+
+
+def _reorder_blocks_by_columns(
+    blocks: list, column_boundaries: list[tuple[int, int]]
+) -> list:
+    """
+    Re-sort OCR text blocks so they read column-by-column, top-to-bottom
+    within each column, left-to-right across columns.
+
+    Without this, a two-column lab report reads as:
+      "Test Name  Value  Test Name  Value …" (row-by-row across both columns)
+    With this it reads:
+      "Test Name  Value  …  [end of left col]  Test Name  Value …"
+    """
+    if len(column_boundaries) <= 1:
+        return blocks
+
+    groups: list[list] = [[] for _ in column_boundaries]
+    for block in blocks:
+        cx = (block.bbox.x + block.bbox.width / 2) if block.bbox else 0
+        placed = False
+        for idx, (cs, ce) in enumerate(column_boundaries):
+            if cs <= cx < ce:
+                groups[idx].append(block)
+                placed = True
+                break
+        if not placed:
+            groups[-1].append(block)
+
+    reordered = []
+    for col_blocks in groups:
+        reordered.extend(sorted(col_blocks, key=lambda b: (b.bbox.y if b.bbox else 0)))
+    return reordered
+
+
+def _raw_text_in_column_order(
+    blocks: list, column_boundaries: list[tuple[int, int]]
+) -> str:
+    """
+    Produce raw_text string that reads in correct column order.
+    Each column's text is separated by a blank line so the LLM
+    understands the column boundary.
+    """
+    if len(column_boundaries) <= 1:
+        return "\n".join(b.text for b in blocks if b.text)
+
+    groups: list[list] = [[] for _ in column_boundaries]
+    for block in blocks:
+        cx = (block.bbox.x + block.bbox.width / 2) if block.bbox else 0
+        for idx, (cs, ce) in enumerate(column_boundaries):
+            if cs <= cx < ce:
+                groups[idx].append(block)
+                break
+        else:
+            groups[-1].append(block)
+
+    col_texts = []
+    for col_blocks in groups:
+        sorted_blocks = sorted(col_blocks, key=lambda b: (b.bbox.y if b.bbox else 0))
+        text = "\n".join(b.text for b in sorted_blocks if b.text)
+        if text.strip():
+            col_texts.append(text)
+    return "\n\n---\n\n".join(col_texts)
+
+
+# ── Header / footer metadata extraction ──────────────────────────────────────
+
+# Regex patterns for structured medical fields found in page headers
+_HEADER_PATTERNS: dict[str, list[str]] = {
+    "patient_name": [
+        r"(?i)patient(?:\s+name)?[:\s]+([A-Z][a-zA-Z]+(?:[,\s]+[A-Z][a-zA-Z]+){1,3})",
+        r"(?i)(?:^|\n)name[:\s]+([A-Z][a-zA-Z]+(?:[,\s]+[A-Z][a-zA-Z]+){1,3})",
+    ],
+    "dob": [
+        r"(?i)(?:dob|date\s+of\s+birth|birth(?:\s+date)?)[:\s]+(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})",
+    ],
+    "mrn": [
+        r"(?i)(?:mrn|medical\s+record\s+(?:number|no\.?|#))[:\s#]*([A-Z0-9\-]{4,20})",
+        r"(?i)(?:patient\s+(?:id|#))[:\s#]*([A-Z0-9\-]{4,20})",
+        r"(?i)(?:acct\.?|account)\s*#?\s*[:\s]*([A-Z0-9\-]{4,20})",
+    ],
+    "visit_date": [
+        r"(?i)(?:visit|encounter|service|admit(?:ted)?|discharge)\s+date[:\s]+(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})",
+        r"(?i)(?:^|\n)date[:\s]+(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})",
+    ],
+    "physician": [
+        r"(?i)(?:physician|provider|doctor|attending|ordering|dr\.?)[:\s]+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,3})",
+    ],
+    "facility": [
+        r"(?i)(?:facility|hospital|clinic|location|site)[:\s]+([A-Za-z0-9\s&'\.]+(?:Hospital|Medical|Clinic|Center|Health|System))",
+    ],
+    "ssn_last4": [
+        r"(?i)(?:ssn|social)[:\s#]*\*+(\d{4})",
+    ],
+}
+
+
+def _parse_medical_header(text: str) -> dict[str, str]:
+    """Extract structured medical metadata from raw header/footer text."""
+    metadata: dict[str, str] = {}
+    for field, patterns in _HEADER_PATTERNS.items():
+        for pattern in patterns:
+            m = re.search(pattern, text)
+            if m:
+                metadata[field] = m.group(1).strip()
+                break
+    return metadata
+
+
+def _extract_header_footer(
+    img, ocr_svc, languages,
+    header_frac: float = 0.11,
+    footer_frac: float = 0.07,
+) -> tuple[str, str, dict[str, str]]:
+    """
+    Split the image into header / body / footer bands and OCR each band.
+
+    Returns (header_text, footer_text, metadata_dict).
+    The body crop is NOT returned — the main OCR pipeline handles the full page.
+    Metadata dict contains structured fields: patient_name, dob, mrn, etc.
+    """
+    header_text = ""
+    footer_text = ""
+    metadata: dict[str, str] = {}
+
+    try:
+        from PIL import Image as PilImage
+        w, h = img.size
+        header_h = max(30, int(h * header_frac))
+        footer_h = max(20, int(h * footer_frac))
+
+        header_band = img.crop((0, 0, w, header_h))
+        footer_band = img.crop((0, h - footer_h, w, h))
+
+        # Run Tesseract on each band directly (faster than full OCR service)
+        try:
+            import pytesseract
+            header_text = pytesseract.image_to_string(header_band, lang="eng").strip()
+            footer_text = pytesseract.image_to_string(footer_band, lang="eng").strip()
+        except Exception:
+            # Fall back to OCR service
+            try:
+                ht, _, _, _ = ocr_svc.process_image(header_band, OCREngine.TESSERACT, False, languages, 0)
+                header_text = ht
+            except Exception:
+                pass
+
+        metadata = _parse_medical_header(header_text + "\n" + footer_text)
+
+        if metadata:
+            logger.debug(f"Header metadata extracted: {list(metadata.keys())}")
+
+    except Exception as exc:
+        logger.debug(f"Header/footer extraction failed: {exc}")
+
+    return header_text, footer_text, metadata
+
+
+# ── Checkbox / form field detection ──────────────────────────────────────────
+
+# Unicode checkbox characters Tesseract may produce
+_CHECKBOX_CHARS = {"□", "■", "☐", "☑", "☒", "✓", "✗", "✘", "◻", "◼", "▢", "▣"}
+_CHECKED_CHARS  = {"■", "☑", "☒", "✓", "✗", "✘", "◼", "▣"}
+
+
+def _detect_checkboxes(img, page_idx: int = 0) -> list[dict]:
+    """
+    Detect checkboxes and their checked/unchecked state from a medical form image.
+
+    Strategy 1 — Unicode detection:
+      Tesseract often produces □ / ■ / ☑ characters for checkboxes.
+      We find them in the word-level data and look for the label to their right.
+
+    Strategy 2 — Image analysis:
+      Find small square contours by scanning for enclosed dark rectangles
+      (aspect ratio 0.7–1.3, small area, thin border).
+      Measure fill ratio inside the square to determine checked state.
+
+    Returns list of dicts: {label, checked, x, y, width, height, source}
+    """
+    checkboxes: list[dict] = []
+
+    # ── Strategy 1: Unicode characters from Tesseract ────────────────────────
+    try:
+        import pytesseract
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+        n = len(data["text"])
+        for i in range(n):
+            word = str(data["text"][i]).strip()
+            if any(ch in word for ch in _CHECKBOX_CHARS):
+                checked = any(ch in word for ch in _CHECKED_CHARS)
+                # Collect label: words to the right on the same line (within 300px)
+                label_parts = []
+                cy = data["top"][i] + data["height"][i] // 2
+                cx_right = data["left"][i] + data["width"][i]
+                for j in range(i + 1, min(i + 8, n)):
+                    jw = str(data["text"][j]).strip()
+                    if not jw:
+                        continue
+                    jcy = data["top"][j] + data["height"][j] // 2
+                    jcx = data["left"][j]
+                    if abs(jcy - cy) <= 15 and jcx - cx_right < 300:
+                        label_parts.append(jw)
+                        cx_right = data["left"][j] + data["width"][j]
+                    elif abs(jcy - cy) > 15:
+                        break
+                label = " ".join(label_parts)
+                checkboxes.append({
+                    "label": label,
+                    "checked": checked,
+                    "x": data["left"][i],
+                    "y": data["top"][i],
+                    "width": data["width"][i],
+                    "height": data["height"][i],
+                    "source": "unicode",
+                })
+    except Exception as exc:
+        logger.debug(f"Checkbox unicode scan failed: {exc}")
+
+    # ── Strategy 2: Image analysis for drawn square checkboxes ───────────────
+    # Only run if strategy 1 found nothing (avoid duplicates)
+    if not checkboxes:
+        try:
+            from PIL import Image as PilImage
+            import pytesseract
+
+            gray = img.convert("L")
+            w, h = gray.size
+
+            # Build binary image: dark pixels = 1
+            pixels = list(gray.getdata())
+            binary = [1 if p < 128 else 0 for p in pixels]
+
+            # Scan for small filled rectangular regions (checkbox squares)
+            # Expected checkbox size: 8–30px
+            min_sz, max_sz = 8, 35
+
+            checked_candidates: list[dict] = []
+            visited = set()
+
+            for y in range(0, h - min_sz, 3):
+                for x in range(0, w - min_sz, 3):
+                    if (x, y) in visited:
+                        continue
+                    if binary[y * w + x] != 1:
+                        continue
+
+                    # Try to find a square box starting at (x, y)
+                    # Check top border
+                    box_w = 0
+                    for bw in range(min_sz, min(max_sz + 1, w - x)):
+                        if binary[y * w + (x + bw)] == 1:
+                            box_w = bw
+                        else:
+                            break
+                    if box_w < min_sz:
+                        continue
+
+                    # Check left border height
+                    box_h = 0
+                    for bh in range(min_sz, min(max_sz + 1, h - y)):
+                        if binary[(y + bh) * w + x] == 1:
+                            box_h = bh
+                        else:
+                            break
+                    if box_h < min_sz:
+                        continue
+
+                    # Aspect ratio check (must be roughly square)
+                    ar = box_w / box_h if box_h else 0
+                    if not (0.6 <= ar <= 1.6):
+                        continue
+
+                    # Measure fill ratio inside the box
+                    inner_x1, inner_y1 = x + 2, y + 2
+                    inner_x2, inner_y2 = x + box_w - 2, y + box_h - 2
+                    if inner_x2 <= inner_x1 or inner_y2 <= inner_y1:
+                        continue
+
+                    inner_pixels = [
+                        binary[iy * w + ix]
+                        for iy in range(inner_y1, inner_y2)
+                        for ix in range(inner_x1, inner_x2)
+                    ]
+                    fill_ratio = sum(inner_pixels) / len(inner_pixels) if inner_pixels else 0
+                    checked = fill_ratio > 0.25  # >25% dark inside = checked
+
+                    # Mark region visited
+                    for iy in range(y, y + box_h):
+                        for ix in range(x, x + box_w):
+                            visited.add((ix, iy))
+
+                    # Find label to the right using Tesseract
+                    label = ""
+                    try:
+                        label_crop = img.crop((
+                            x + box_w + 2,
+                            max(0, y - 3),
+                            min(w, x + box_w + 200),
+                            min(h, y + box_h + 3),
+                        ))
+                        label = pytesseract.image_to_string(
+                            label_crop, config="--psm 7"
+                        ).strip()
+                    except Exception:
+                        pass
+
+                    checked_candidates.append({
+                        "label": label,
+                        "checked": checked,
+                        "x": x, "y": y,
+                        "width": box_w, "height": box_h,
+                        "source": "image",
+                    })
+
+            checkboxes.extend(checked_candidates)
+
+        except Exception as exc:
+            logger.debug(f"Checkbox image analysis failed: {exc}")
+
+    if checkboxes:
+        logger.debug(f"Detected {len(checkboxes)} checkbox(es) on page {page_idx + 1}")
+
+    return checkboxes
+
+
+def _checkboxes_to_text(checkboxes: list[dict]) -> str:
+    """Convert detected checkboxes to readable text for the LLM."""
+    if not checkboxes:
+        return ""
+    lines = ["[Form Fields]"]
+    for cb in checkboxes:
+        mark = "☑" if cb["checked"] else "☐"
+        label = cb.get("label", "").strip() or "(no label)"
+        lines.append(f"  {mark} {label}")
+    return "\n".join(lines)
+
+
+# ── Image enhancement for medical scans ──────────────────────────────────────
+
 def _enhance_medical_image(img):
     """
     Full enhancement pipeline for medical document images:
@@ -403,7 +815,26 @@ class DocumentProcessor:
             if regions:
                 blocks = self._assign_text_to_regions(regions, blocks)
 
-            clean_text = _clean_medical_text(text)
+            # Header / footer metadata
+            header_text, footer_text, header_meta = _extract_header_footer(
+                img, self.ocr_svc, languages
+            )
+
+            # Multi-column reading order
+            col_boundaries = _detect_column_boundaries(img)
+            col_count = len(col_boundaries)
+            if col_count > 1:
+                logger.info(f"PDF page {page_idx + 1}: detected {col_count} columns")
+                blocks = _reorder_blocks_by_columns(blocks, col_boundaries)
+                clean_text = _raw_text_in_column_order(blocks, col_boundaries)
+            else:
+                clean_text = _clean_medical_text(text)
+
+            # Checkbox detection
+            checkboxes = _detect_checkboxes(img, page_idx)
+            checkbox_text = _checkboxes_to_text(checkboxes)
+            if checkbox_text:
+                clean_text = clean_text + "\n\n" + checkbox_text
 
             return DocumentPage(
                 page_number=page_idx + 1,
@@ -413,6 +844,11 @@ class DocumentProcessor:
                 tables=[],
                 raw_text=clean_text,
                 confidence=conf,
+                header_text=header_text,
+                footer_text=footer_text,
+                header_metadata=header_meta,
+                column_count=col_count,
+                checkboxes=checkboxes,
             )
 
         except MemoryError:
@@ -744,7 +1180,15 @@ class DocumentProcessor:
 
     def _ocr_image_frame(self, img, frame_idx: int, ocr_engine, enhance, languages,
                           retry: int = 0, extract_tables: bool = True) -> DocumentPage:
-        """OCR a single image frame with full medical preprocessing and table extraction."""
+        """
+        OCR a single image frame with full medical CV pipeline:
+          - Blank page skip
+          - Enhancement + auto-rotation
+          - Header/footer extraction with metadata parsing
+          - Multi-column reading order
+          - Table extraction
+          - Checkbox/form field detection
+        """
         try:
             # Blank page check — skip expensive OCR entirely
             if _is_blank_page(img):
@@ -760,6 +1204,11 @@ class DocumentProcessor:
             if enhance:
                 img = _enhance_medical_image(img)
             img, rotation = _auto_rotate(img)
+
+            # ── Header / footer extraction (before full OCR) ──────────────
+            header_text, footer_text, header_meta = _extract_header_footer(
+                img, self.ocr_svc, languages
+            )
 
             text, blocks, engine, conf = self.ocr_svc.process_image(
                 img, ocr_engine, enhance, languages, frame_idx
@@ -781,7 +1230,17 @@ class DocumentProcessor:
             except Exception as exc:
                 logger.debug(f"Layout analysis failed (non-fatal): {exc}")
 
-            # Table extraction from image — works for JPEG, PNG, TIFF, etc.
+            # ── Multi-column reading order ────────────────────────────────
+            col_boundaries = _detect_column_boundaries(img)
+            col_count = len(col_boundaries)
+            if col_count > 1:
+                logger.info(f"Frame {frame_idx + 1}: detected {col_count} columns")
+                blocks = _reorder_blocks_by_columns(blocks, col_boundaries)
+                text = _raw_text_in_column_order(blocks, col_boundaries)
+            else:
+                text = _clean_medical_text(text)
+
+            # ── Table extraction ──────────────────────────────────────────
             tables: list[Table] = []
             if extract_tables:
                 tables = self._extract_image_tables(img, frame_idx)
@@ -789,14 +1248,25 @@ class DocumentProcessor:
                     logger.info(f"Frame {frame_idx + 1}: extracted {len(tables)} table(s) "
                                 f"({sum(t.rows for t in tables)} rows total)")
 
+            # ── Checkbox / form field detection ───────────────────────────
+            checkboxes = _detect_checkboxes(img, frame_idx)
+            checkbox_text = _checkboxes_to_text(checkboxes)
+            if checkbox_text:
+                text = text + "\n\n" + checkbox_text
+
             return DocumentPage(
                 page_number=frame_idx + 1,
                 width=float(img.width),
                 height=float(img.height),
                 text_blocks=blocks,
                 tables=tables,
-                raw_text=_clean_medical_text(text),
+                raw_text=text,
                 confidence=conf,
+                header_text=header_text,
+                footer_text=footer_text,
+                header_metadata=header_meta,
+                column_count=col_count,
+                checkboxes=checkboxes,
             )
 
         except Exception as exc:
