@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     HF_TOKEN: Optional[str] = None
     DEFAULT_BASE_MODEL: str = "meta-llama/Llama-3.2-3B-Instruct"
 
+    # Local HuggingFace models (for multi-LLM and fine-tuning)
+    LOCAL_MODEL_DIR: str = "./models/local"
+    DEFAULT_LOCAL_MODEL: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
     # Redis (for task queue)
     REDIS_URL: str = "redis://localhost:6379/0"
 
@@ -68,3 +72,5 @@ settings = Settings()
 os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
 os.makedirs(settings.MODELS_DIR, exist_ok=True)
 os.makedirs(settings.DATASETS_DIR, exist_ok=True)
+os.makedirs(settings.LOCAL_MODEL_DIR, exist_ok=True)
+os.makedirs(f"{settings.LOCAL_MODEL_DIR}/fine-tuned", exist_ok=True)
