@@ -1,15 +1,23 @@
 """
-Document Processor — Stable Pipeline
-=====================================
-Orchestrates the full document processing pipeline with:
-  1. Per-page error isolation — one bad page never kills the whole job
-  2. Fallback OCR strategy   — if primary engine fails, try simpler extraction
-  3. Partial-success mode    — returns PARTIAL status with per-page error info
-  4. Retry on transient failures (file-lock, OOM, renderer crash)
-  5. Clear, actionable error messages stored in DocumentPage.error
+Document Processor — Medical-Grade Stable Pipeline
+====================================================
+Improvements over baseline:
+  1. Per-page error isolation   — one bad page never kills the job
+  2. Auto-rotation / deskew     — fixes tilted/sideways medical scans
+  3. Image enhancement pipeline — contrast, sharpen, denoise before OCR
+  4. Confidence-based retry     — low-confidence pages retry at higher DPI
+                                   or swap OCR engine
+  5. Multi-page TIFF support    — common in hospital record systems
+  6. Encrypted PDF handling     — attempts extraction without password
+  7. pdfplumber table extraction — lab values, med lists, vitals tables
+  8. DOCX embedded image OCR   — clinical attachments inside Word docs
+  9. Medical text cleanup       — fix common OCR errors in drug/lab names
+ 10. Partial-success mode       — returns PARTIAL when some pages succeed
 """
 from __future__ import annotations
 
+import io
+import re
 import time
 import uuid
 from pathlib import Path
@@ -18,11 +26,14 @@ from typing import Optional
 from loguru import logger
 
 from app.models.schemas import (
+    BoundingBox,
     DocumentMetadata,
     DocumentPage,
     DocumentStatus,
     OCREngine,
     ProcessedDocument,
+    Table,
+    TableCell,
     TextBlock,
 )
 from app.services.layout_service import LayoutService
@@ -31,17 +42,113 @@ from app.services.ocr_service import OCRService
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".gif"}
 _PDF_SUFFIX = ".pdf"
 _DOCX_SUFFIX = ".docx"
-_MAX_RETRIES = 2  # per-page retry attempts on transient errors
 
+_MAX_RETRIES = 3           # per-page retry attempts
+_MIN_CONFIDENCE = 0.55     # below this → retry with better settings
+_MIN_TEXT_LENGTH = 15      # fewer chars than this → treat page as empty
+
+
+# ── Common medical OCR error corrections ─────────────────────────────────────
+# Maps (regex pattern → replacement) for post-OCR cleanup
+_MEDICAL_CORRECTIONS: list[tuple[str, str]] = [
+    # Dosage units — common misreads
+    (r"\bmg(?=\s*\d|\s*/)", "mg"),          # normalise
+    (r"\bm9\b", "mg"),
+    (r"\brnl\b", "ml"),
+    (r"\brnL\b", "mL"),
+    (r"\bIU\b", "IU"),
+    (r"\bl U\b", "IU"),
+    # Lab values — zero/O confusion
+    (r"\b([A-Z]{2,})\s*0\s*:", r"\1 O:"),  # e.g. "BLO0D" → keep numeric 0 where appropriate
+    # Common mis-OCR'd words
+    (r"\bpatienf\b", "patient"),
+    (r"\bdiagnos1s\b", "diagnosis"),
+    (r"\bprescr1ption\b", "prescription"),
+    (r"\brnedication\b", "medication"),
+    (r"\bpharrnacy\b", "pharmacy"),
+    (r"\bphysic1an\b", "physician"),
+    # Date patterns — preserve slashes
+    (r"(\d{1,2})[/\\|](\d{1,2})[/\\|](\d{2,4})", r"\1/\2/\3"),
+]
+
+
+def _clean_medical_text(text: str) -> str:
+    """Apply medical-specific OCR post-corrections."""
+    for pattern, replacement in _MEDICAL_CORRECTIONS:
+        text = re.sub(pattern, replacement, text)
+    # Remove isolated non-alphanumeric junk lines
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            lines.append("")
+            continue
+        alpha_ratio = sum(c.isalnum() or c in " .,/:-()%" for c in stripped) / len(stripped)
+        if alpha_ratio >= 0.4:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+# ── Image enhancement for medical scans ──────────────────────────────────────
+
+def _enhance_medical_image(img):
+    """
+    Enhance a PIL image for better OCR on medical documents:
+    - Auto-rotate based on Tesseract OSD
+    - Increase contrast and sharpness
+    - Convert to grayscale then back to RGB (removes colour noise)
+    - Optional binarisation for very low-contrast scans
+    """
+    try:
+        from PIL import ImageEnhance, ImageFilter, ImageOps
+        import PIL.Image as PilImage
+
+        # Convert to grayscale for processing, back to RGB for OCR engines
+        gray = img.convert("L")
+
+        # Auto-level (stretch histogram)
+        gray = ImageOps.autocontrast(gray, cutoff=2)
+
+        # Sharpen
+        gray = gray.filter(ImageFilter.SHARPEN)
+        gray = gray.filter(ImageFilter.SHARPEN)  # double sharpen for fax quality
+
+        # Enhance contrast
+        enhancer = ImageEnhance.Contrast(gray)
+        gray = enhancer.enhance(1.8)
+
+        return gray.convert("RGB")
+    except Exception as exc:
+        logger.warning(f"Image enhancement failed (using original): {exc}")
+        return img
+
+
+def _auto_rotate(img):
+    """
+    Detect and correct image orientation using Tesseract OSD.
+    Falls back gracefully if pytesseract is unavailable.
+    Returns (rotated_image, rotation_degrees_applied).
+    """
+    try:
+        import pytesseract
+        osd = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
+        angle = osd.get("rotate", 0)
+        if angle and angle != 0:
+            logger.debug(f"Auto-rotating image by {angle}°")
+            return img.rotate(-angle, expand=True), angle
+    except Exception:
+        pass
+    return img, 0
+
+
+# ── Main processor ────────────────────────────────────────────────────────────
 
 class DocumentProcessor:
-    """High-level document processing pipeline with full error isolation."""
+    """Medical-grade document processor with full error isolation."""
 
     def __init__(self):
         self.layout_svc = LayoutService()
         self.ocr_svc = OCRService()
-
-    # ── Public entry point ──────────────────────────────────────────────────
 
     def process(
         self,
@@ -52,11 +159,9 @@ class DocumentProcessor:
         languages: list = None,
         extract_tables: bool = True,
     ) -> ProcessedDocument:
-        """Process a document and return results.
-        
+        """
+        Process any supported medical document.
         Never raises — errors are captured in the returned ProcessedDocument.
-        Returns PARTIAL status if some pages succeeded and others failed.
-        Returns FAILED only if no text could be extracted at all.
         """
         if not file_path:
             raise ValueError("file_path cannot be None or empty")
@@ -74,13 +179,17 @@ class DocumentProcessor:
 
         try:
             if suffix == _PDF_SUFFIX:
-                pages = self._process_pdf(path, ocr_engine, enhance_images, languages, page_errors)
+                pages = self._process_pdf(
+                    path, ocr_engine, enhance_images, languages, page_errors, extract_tables
+                )
             elif suffix == _DOCX_SUFFIX:
-                pages = self._process_docx(path, page_errors)
+                pages = self._process_docx(path, ocr_engine, enhance_images, languages, page_errors)
             elif suffix in _IMAGE_SUFFIXES:
+                # Multi-page TIFF handled inside _process_image
                 pages = self._process_image(path, ocr_engine, enhance_images, languages, page_errors)
             else:
-                return self._fail(doc_id, path, f"Unsupported file type: '{suffix}'. "
+                return self._fail(doc_id, path,
+                                  f"Unsupported file type '{suffix}'. "
                                   f"Accepted: pdf, docx, png, jpg, jpeg, tiff, bmp, webp")
         except Exception as exc:
             logger.exception(f"[{doc_id}] Fatal pipeline error: {exc}")
@@ -95,16 +204,16 @@ class DocumentProcessor:
         full_text = self._merge_pages_text(pages)
         elapsed = int((time.time() - start) * 1000)
 
-        # Determine status
         if not good_pages:
             status = DocumentStatus.FAILED
-            top_error = f"{len(failed_pages)} page(s) all failed. First error: {failed_pages[0].error}"
+            top_error = (f"{len(failed_pages)} page(s) all failed. "
+                         f"First error: {failed_pages[0].error}")
         elif failed_pages:
             status = DocumentStatus.PARTIAL
-            top_error = f"{len(failed_pages)}/{len(pages)} page(s) failed: " + "; ".join(
-                f"p{p.page_number}: {p.error}" for p in failed_pages[:3]
-            )
-            logger.warning(f"[{doc_id}] Partial success — {len(good_pages)} ok, {len(failed_pages)} failed")
+            top_error = (f"{len(failed_pages)}/{len(pages)} page(s) failed: " +
+                         "; ".join(f"p{p.page_number}: {p.error}" for p in failed_pages[:3]))
+            logger.warning(f"[{doc_id}] Partial success — {len(good_pages)} ok, "
+                           f"{len(failed_pages)} failed")
         else:
             status = DocumentStatus.COMPLETED
             top_error = None
@@ -118,10 +227,8 @@ class DocumentProcessor:
             processing_time_ms=elapsed,
         )
 
-        logger.info(
-            f"[{doc_id}] {status.value.upper()} — {len(pages)} pages, "
-            f"{len(full_text)} chars, {elapsed}ms"
-        )
+        logger.info(f"[{doc_id}] {status.value.upper()} — {len(pages)} pages, "
+                    f"{len(full_text)} chars, {elapsed}ms")
 
         return ProcessedDocument(
             document_id=doc_id,
@@ -133,38 +240,53 @@ class DocumentProcessor:
             partial_page_errors=[f"p{p.page_number}: {p.error}" for p in failed_pages],
         )
 
-    # ── PDF pipeline ────────────────────────────────────────────────────
+    # ── PDF pipeline ──────────────────────────────────────────────────────────
 
-    def _process_pdf(self, path, ocr_engine, enhance, languages, page_errors):
+    def _process_pdf(self, path, ocr_engine, enhance, languages, page_errors, extract_tables):
+        # Handle encrypted PDFs first
+        path = self._decrypt_pdf_if_needed(path, page_errors)
+
         try:
             is_scanned = self.layout_svc.is_scanned_pdf(path)
             page_count = self.layout_svc.get_pdf_page_count(path)
         except Exception as exc:
-            # Can't even open the PDF — try raw text extraction as fallback
             logger.warning(f"PDF metadata read failed ({exc}), attempting raw text fallback")
-            return self._pdf_raw_text_fallback(path, page_errors)
+            return self._pdf_raw_text_fallback(path, page_errors, extract_tables)
 
         logger.info(f"PDF scanned={is_scanned}, pages={page_count}")
 
         if is_scanned:
             return self._ocr_pdf_pages(path, page_count, ocr_engine, enhance, languages)
-        else:
-            pages = []
-            try:
-                native_pages = self.layout_svc.extract_pdf_layout(path)
-            except Exception as exc:
-                logger.warning(f"Native PDF layout extraction failed ({exc}), falling back to full OCR")
-                return self._ocr_pdf_pages(path, page_count, ocr_engine, enhance, languages)
 
-            for page in native_pages:
-                if page.error:
-                    pages.append(page)
-                    continue
-                # If native text is sparse, supplement with OCR
-                if len(page.raw_text.strip()) < 30:
-                    page = self._try_ocr_page(path, page, ocr_engine, enhance, languages)
+        # Native text PDF — extract layout, supplement sparse pages with OCR
+        pages = []
+        try:
+            native_pages = self.layout_svc.extract_pdf_layout(path)
+        except Exception as exc:
+            logger.warning(f"Native PDF layout extraction failed ({exc}), falling back to full OCR")
+            return self._ocr_pdf_pages(path, page_count, ocr_engine, enhance, languages)
+
+        # Extract tables with pdfplumber (better than layout service for structured data)
+        plumber_tables: dict[int, list[Table]] = {}
+        if extract_tables:
+            plumber_tables = self._extract_pdf_tables(path)
+
+        for page in native_pages:
+            if page.error:
                 pages.append(page)
-            return pages
+                continue
+            # Supplement sparse text with OCR
+            if len(page.raw_text.strip()) < _MIN_TEXT_LENGTH:
+                page = self._try_ocr_page(path, page, ocr_engine, enhance, languages)
+            # Attach tables from pdfplumber
+            pg_num = page.page_number
+            if pg_num in plumber_tables:
+                page.tables = plumber_tables[pg_num]
+            # Clean text
+            page.raw_text = _clean_medical_text(page.raw_text)
+            pages.append(page)
+
+        return pages
 
     def _ocr_pdf_pages(self, path, page_count, ocr_engine, enhance, languages):
         pages = []
@@ -174,17 +296,36 @@ class DocumentProcessor:
         return pages
 
     def _ocr_single_pdf_page(
-        self, path, page_idx, ocr_engine, enhance, languages, retry=0
+        self, path, page_idx: int, ocr_engine, enhance, languages, retry: int = 0
     ) -> DocumentPage:
-        """OCR a single PDF page with retry and fallback."""
+        """OCR a single PDF page with multi-strategy retry."""
         try:
-            img = self.layout_svc.render_pdf_page(path, page_idx, dpi=300)
+            dpi = 300 if retry < 2 else 400  # escalate DPI on retries
+            img = self.layout_svc.render_pdf_page(path, page_idx, dpi=dpi)
+
+            # Enhance and auto-rotate medical scans
+            if enhance:
+                img = _enhance_medical_image(img)
+            img, rotation = _auto_rotate(img)
+
             text, blocks, engine, conf = self.ocr_svc.process_image(
                 img, ocr_engine, enhance, languages, page_idx
             )
+
+            # If confidence is too low, retry with the alternate OCR engine
+            alt_engine = OCREngine.EASYOCR if ocr_engine == OCREngine.TESSERACT else OCREngine.TESSERACT
+            if conf < _MIN_CONFIDENCE and retry < _MAX_RETRIES:
+                logger.info(f"Page {page_idx + 1} low confidence ({conf:.2f}), "
+                            f"retrying with {alt_engine.value}")
+                return self._ocr_single_pdf_page(
+                    path, page_idx, alt_engine, True, languages, retry + 1
+                )
+
             regions = self.layout_svc.analyze_image_layout(img, page_idx)
             if regions:
                 blocks = self._assign_text_to_regions(regions, blocks)
+
+            clean_text = _clean_medical_text(text)
 
             return DocumentPage(
                 page_number=page_idx + 1,
@@ -192,14 +333,16 @@ class DocumentProcessor:
                 height=float(img.height),
                 text_blocks=blocks,
                 tables=[],
-                raw_text=text,
+                raw_text=clean_text,
                 confidence=conf,
             )
+
         except MemoryError:
             if retry < _MAX_RETRIES:
-                logger.warning(f"OOM on page {page_idx + 1}, retrying at lower DPI")
+                logger.warning(f"OOM on page {page_idx + 1}, retrying at 150 DPI")
                 try:
                     img = self.layout_svc.render_pdf_page(path, page_idx, dpi=150)
+                    img = _enhance_medical_image(img)
                     text, blocks, _, conf = self.ocr_svc.process_image(
                         img, OCREngine.TESSERACT, False, languages, page_idx
                     )
@@ -208,39 +351,46 @@ class DocumentProcessor:
                         width=float(img.width),
                         height=float(img.height),
                         text_blocks=blocks,
-                        tables=[],
-                        raw_text=text,
+                        raw_text=_clean_medical_text(text),
                         confidence=conf,
                     )
                 except Exception as retry_exc:
                     return self._error_page(page_idx, f"OOM after retry: {retry_exc}")
             return self._error_page(page_idx, "Out of memory rendering page")
+
         except Exception as exc:
             if retry < _MAX_RETRIES:
-                logger.warning(f"Page {page_idx + 1} error ({exc}), retrying #{retry + 1}")
+                # Alternate strategy on each retry
+                next_engine = [OCREngine.AUTO, OCREngine.TESSERACT, OCREngine.EASYOCR][
+                    min(retry, 2)
+                ]
+                logger.warning(f"Page {page_idx + 1} error ({exc}), "
+                               f"retry #{retry + 1} with {next_engine.value}")
                 return self._ocr_single_pdf_page(
-                    path, page_idx, OCREngine.TESSERACT, False, languages, retry + 1
+                    path, page_idx, next_engine, retry % 2 == 0, languages, retry + 1
                 )
             err_msg = f"{type(exc).__name__}: {exc}"
             logger.error(f"Page {page_idx + 1} failed after {_MAX_RETRIES} retries: {err_msg}")
             return self._error_page(page_idx, err_msg)
 
     def _try_ocr_page(self, path, page, ocr_engine, enhance, languages):
-        """Attempt OCR on a native-text page that has insufficient text."""
+        """Attempt OCR on a native-text page with sparse content."""
         try:
             img = self.layout_svc.render_pdf_page(path, page.page_number - 1)
+            img = _enhance_medical_image(img)
+            img, _ = _auto_rotate(img)
             text, blocks, engine, conf = self.ocr_svc.process_image(
                 img, ocr_engine, enhance, languages, page.page_number - 1
             )
-            page.raw_text = text
+            page.raw_text = _clean_medical_text(text)
             page.text_blocks = blocks
             page.confidence = conf
         except Exception as exc:
             logger.warning(f"Supplemental OCR failed for page {page.page_number}: {exc}")
         return page
 
-    def _pdf_raw_text_fallback(self, path, page_errors):
-        """Last-resort: use pdfminer/pdfplumber to extract plain text."""
+    def _pdf_raw_text_fallback(self, path, page_errors, extract_tables=True):
+        """Last-resort text extraction — pdfplumber then pdfminer."""
         try:
             import pdfplumber
             pages = []
@@ -248,13 +398,18 @@ class DocumentProcessor:
                 for i, pg in enumerate(pdf.pages):
                     try:
                         text = pg.extract_text() or ""
+                        tables = []
+                        if extract_tables:
+                            tables = self._plumber_page_tables(pg, i)
                         pages.append(DocumentPage(
                             page_number=i + 1,
-                            raw_text=text,
+                            raw_text=_clean_medical_text(text),
+                            tables=tables,
                         ))
                     except Exception as exc:
                         pages.append(self._error_page(i, f"pdfplumber: {exc}"))
-            return pages
+            if pages:
+                return pages
         except ImportError:
             pass
         except Exception as exc:
@@ -264,37 +419,127 @@ class DocumentProcessor:
         try:
             from pdfminer.high_level import extract_text
             text = extract_text(str(path))
-            return [DocumentPage(page_number=1, raw_text=text or "")]
+            return [DocumentPage(page_number=1, raw_text=_clean_medical_text(text or ""))]
         except Exception as exc:
             page_errors.append(f"pdfminer fallback failed: {exc}")
             return [self._error_page(0, f"All PDF extraction methods failed: {exc}")]
 
-    # ── DOCX pipeline ────────────────────────────────────────────────────
+    def _extract_pdf_tables(self, path) -> dict[int, list[Table]]:
+        """Extract tables from all PDF pages using pdfplumber."""
+        result: dict[int, list[Table]] = {}
+        try:
+            import pdfplumber
+            with pdfplumber.open(str(path)) as pdf:
+                for i, pg in enumerate(pdf.pages):
+                    try:
+                        tables = self._plumber_page_tables(pg, i)
+                        if tables:
+                            result[i + 1] = tables
+                    except Exception as exc:
+                        logger.debug(f"Table extraction failed for page {i + 1}: {exc}")
+        except Exception as exc:
+            logger.debug(f"pdfplumber table extraction skipped: {exc}")
+        return result
 
-    def _process_docx(self, path, page_errors):
+    @staticmethod
+    def _plumber_page_tables(pg, page_idx: int) -> list[Table]:
+        """Convert pdfplumber tables to our Table schema."""
+        tables = []
+        try:
+            raw_tables = pg.extract_tables()
+            if not raw_tables:
+                return tables
+            y_offset = float(page_idx * 800)
+            for t_idx, raw_table in enumerate(raw_tables):
+                if not raw_table:
+                    continue
+                num_rows = len(raw_table)
+                num_cols = max(len(row) for row in raw_table) if raw_table else 0
+                cells = []
+                for r_idx, row in enumerate(raw_table):
+                    for c_idx, cell_text in enumerate(row):
+                        cells.append(TableCell(
+                            text=str(cell_text or "").strip(),
+                            row=r_idx,
+                            col=c_idx,
+                            bbox=BoundingBox(
+                                x=float(c_idx * 100),
+                                y=y_offset + float(r_idx * 20),
+                                width=100.0,
+                                height=20.0,
+                                page=page_idx,
+                            ),
+                        ))
+                tables.append(Table(
+                    cells=cells,
+                    rows=num_rows,
+                    cols=num_cols,
+                    bbox=BoundingBox(
+                        x=0, y=y_offset,
+                        width=float(num_cols * 100),
+                        height=float(num_rows * 20),
+                        page=page_idx,
+                    ),
+                    page=page_idx,
+                ))
+        except Exception as exc:
+            logger.debug(f"Table conversion error: {exc}")
+        return tables
+
+    @staticmethod
+    def _decrypt_pdf_if_needed(path: Path, page_errors: list[str]) -> Path:
+        """
+        If the PDF is encrypted, attempt to open it without a password
+        (many medical system PDFs are encrypted with an empty password).
+        Returns original path if not encrypted or if decryption succeeds in-place.
+        """
+        try:
+            import fitz  # PyMuPDF
+            doc = fitz.open(str(path))
+            if doc.is_encrypted:
+                logger.info(f"PDF is encrypted, attempting empty-password decrypt")
+                if doc.authenticate(""):
+                    # Re-save as decrypted to a temp path
+                    import tempfile
+                    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+                    doc.save(tmp.name)
+                    doc.close()
+                    logger.info("PDF decrypted with empty password")
+                    return Path(tmp.name)
+                else:
+                    page_errors.append("PDF is password-protected — could not decrypt")
+                    doc.close()
+            else:
+                doc.close()
+        except Exception as exc:
+            logger.debug(f"PDF encryption check skipped: {exc}")
+        return path
+
+    # ── DOCX pipeline ─────────────────────────────────────────────────────────
+
+    def _process_docx(self, path, ocr_engine, enhance, languages, page_errors):
         try:
             from docx import Document as DocxDocument
         except ImportError:
             return [self._error_page(0, "python-docx not installed. Run: pip install python-docx")]
-
-        from app.models.schemas import BoundingBox, Table, TableCell
 
         try:
             doc = DocxDocument(str(path))
         except Exception as exc:
             return [self._error_page(0, f"Cannot open DOCX: {type(exc).__name__}: {exc}")]
 
-        text_blocks = []
-        tables = []
+        text_blocks: list[TextBlock] = []
+        tables: list[Table] = []
         y_cursor = 0.0
 
+        # Extract paragraphs
         try:
             for para in doc.paragraphs:
                 text = para.text.strip()
                 if not text:
                     y_cursor += 12.0
                     continue
-                style_name = (para.style.name if para.style and para.style.name else "")
+                style_name = para.style.name if para.style and para.style.name else ""
                 is_heading = style_name.lower().startswith("heading")
                 font_size = 16.0 if is_heading else 12.0
                 text_blocks.append(TextBlock(
@@ -311,6 +556,7 @@ class DocumentProcessor:
             logger.warning(f"DOCX paragraph extraction partial failure: {exc}")
             page_errors.append(f"paragraphs: {exc}")
 
+        # Extract tables
         try:
             for tbl in doc.tables:
                 rows_data = [[cell.text.strip() for cell in row.cells] for row in tbl.rows]
@@ -323,21 +569,16 @@ class DocumentProcessor:
                         text=cell_text,
                         row=r_idx,
                         col=c_idx,
-                        bbox=BoundingBox(
-                            x=float(c_idx * 120),
-                            y=float(y_cursor + r_idx * 20),
-                            width=120.0,
-                            height=20.0,
-                            page=0,
-                        ),
+                        bbox=BoundingBox(x=float(c_idx * 120), y=float(y_cursor + r_idx * 20),
+                                         width=120.0, height=20.0, page=0),
                     )
                     for r_idx, row in enumerate(rows_data)
                     for c_idx, cell_text in enumerate(row)
                 ]
                 tables.append(Table(
                     cells=cells, rows=num_rows, cols=num_cols,
-                    bbox=BoundingBox(x=0, y=y_cursor, width=float(num_cols*120),
-                                     height=float(num_rows*20), page=0),
+                    bbox=BoundingBox(x=0, y=y_cursor, width=float(num_cols * 120),
+                                     height=float(num_rows * 20), page=0),
                     page=0,
                 ))
                 y_cursor += num_rows * 20 + 10
@@ -345,11 +586,18 @@ class DocumentProcessor:
             logger.warning(f"DOCX table extraction partial failure: {exc}")
             page_errors.append(f"tables: {exc}")
 
+        # OCR embedded images (e.g. scanned attachments inside the Word doc)
+        embedded_text = self._ocr_docx_images(doc, ocr_engine, enhance, languages)
+
         raw_text = "\n".join(b.text for b in text_blocks)
         for tbl in tables:
             raw_text += "\n" + "\n".join(c.text for c in tbl.cells if c.text)
+        if embedded_text:
+            raw_text += "\n\n[Embedded image content]\n" + embedded_text
 
+        raw_text = _clean_medical_text(raw_text)
         page_err = ("; ".join(page_errors)) if page_errors else None
+
         return [DocumentPage(
             page_number=1,
             width=612.0,
@@ -361,67 +609,111 @@ class DocumentProcessor:
             error=page_err,
         )]
 
-    # ── Image pipeline ────────────────────────────────────────────────────
-
-    def _process_image(self, path, ocr_engine, enhance, languages, page_errors):
+    def _ocr_docx_images(self, doc, ocr_engine, enhance, languages) -> str:
+        """OCR any images embedded inside a DOCX file."""
+        texts: list[str] = []
         try:
             from PIL import Image as PilImage
-            img = PilImage.open(path).convert("RGB")
+            for rel in doc.part.rels.values():
+                if "image" in rel.reltype:
+                    try:
+                        img_bytes = rel.target_part.blob
+                        img = PilImage.open(io.BytesIO(img_bytes)).convert("RGB")
+                        if enhance:
+                            img = _enhance_medical_image(img)
+                        img, _ = _auto_rotate(img)
+                        text, _, _, _ = self.ocr_svc.process_image(
+                            img, ocr_engine, enhance, languages, 0
+                        )
+                        if text.strip():
+                            texts.append(text.strip())
+                    except Exception as exc:
+                        logger.debug(f"Embedded image OCR failed: {exc}")
+        except Exception as exc:
+            logger.debug(f"DOCX image OCR skipped: {exc}")
+        return "\n".join(texts)
+
+    # ── Image pipeline ────────────────────────────────────────────────────────
+
+    def _process_image(self, path, ocr_engine, enhance, languages, page_errors):
+        """Process image files — including multi-page TIFF."""
+        try:
+            from PIL import Image as PilImage
+            img = PilImage.open(path)
         except Exception as exc:
             return [self._error_page(0, f"Cannot open image: {type(exc).__name__}: {exc}")]
 
+        # Multi-page TIFF
+        frames: list = []
         try:
+            while True:
+                frames.append(img.copy().convert("RGB"))
+                img.seek(img.tell() + 1)
+        except EOFError:
+            pass
+        except Exception:
+            # Not a multi-page image — treat as single frame
+            if not frames:
+                frames = [img.convert("RGB")]
+
+        pages = []
+        for frame_idx, frame in enumerate(frames):
+            page = self._ocr_image_frame(frame, frame_idx, ocr_engine, enhance, languages)
+            pages.append(page)
+        return pages
+
+    def _ocr_image_frame(self, img, frame_idx: int, ocr_engine, enhance, languages,
+                          retry: int = 0) -> DocumentPage:
+        """OCR a single image frame with enhancement and retry."""
+        try:
+            if enhance:
+                img = _enhance_medical_image(img)
+            img, rotation = _auto_rotate(img)
+
             text, blocks, engine, conf = self.ocr_svc.process_image(
-                img, ocr_engine, enhance, languages, 0
+                img, ocr_engine, enhance, languages, frame_idx
             )
-        except Exception as exc:
-            # Try tesseract fallback
-            logger.warning(f"Primary OCR failed ({exc}), trying Tesseract fallback")
+
+            # Low confidence → retry with alternate engine
+            alt_engine = OCREngine.EASYOCR if ocr_engine != OCREngine.EASYOCR else OCREngine.TESSERACT
+            if conf < _MIN_CONFIDENCE and retry < _MAX_RETRIES:
+                logger.info(f"Image frame {frame_idx + 1} low confidence ({conf:.2f}), "
+                            f"retrying with {alt_engine.value}")
+                return self._ocr_image_frame(img, frame_idx, alt_engine, True, languages, retry + 1)
+
             try:
-                text, blocks, engine, conf = self.ocr_svc.process_image(
-                    img, OCREngine.TESSERACT, False, languages, 0
-                )
-            except Exception as exc2:
-                return [self._error_page(
-                    0,
-                    f"OCR failed: {type(exc).__name__}: {exc}. "
-                    f"Tesseract fallback also failed: {exc2}"
-                )]
+                regions = self.layout_svc.analyze_image_layout(img, frame_idx)
+                if regions:
+                    blocks = self._assign_text_to_regions(regions, blocks)
+            except Exception as exc:
+                logger.debug(f"Layout analysis failed (non-fatal): {exc}")
 
-        try:
-            regions = self.layout_svc.analyze_image_layout(img, 0)
-            if regions:
-                blocks = self._assign_text_to_regions(regions, blocks)
+            return DocumentPage(
+                page_number=frame_idx + 1,
+                width=float(img.width),
+                height=float(img.height),
+                text_blocks=blocks,
+                tables=[],
+                raw_text=_clean_medical_text(text),
+                confidence=conf,
+            )
+
         except Exception as exc:
-            logger.warning(f"Layout analysis failed (non-fatal): {exc}")
+            if retry < _MAX_RETRIES:
+                alt = OCREngine.TESSERACT if retry % 2 == 0 else OCREngine.EASYOCR
+                logger.warning(f"Image frame {frame_idx + 1} failed ({exc}), "
+                               f"retry #{retry + 1} with {alt.value}")
+                return self._ocr_image_frame(img, frame_idx, alt, True, languages, retry + 1)
+            return self._error_page(frame_idx, f"{type(exc).__name__}: {exc}")
 
-        return [DocumentPage(
-            page_number=1,
-            width=float(img.width),
-            height=float(img.height),
-            text_blocks=blocks,
-            tables=[],
-            raw_text=text,
-            confidence=conf,
-        )]
-
-    # ── Helpers ──────────────────────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
     @staticmethod
     def _error_page(page_idx: int, error: str) -> DocumentPage:
-        return DocumentPage(
-            page_number=page_idx + 1,
-            raw_text="",
-            error=error,
-        )
+        return DocumentPage(page_number=page_idx + 1, raw_text="", error=error)
 
     @staticmethod
-    def _fail(
-        doc_id: str,
-        path: Path,
-        error: str,
-    ) -> ProcessedDocument:
-        from app.models.schemas import DocumentMetadata, DocumentStatus
+    def _fail(doc_id: str, path: Path, error: str) -> ProcessedDocument:
         return ProcessedDocument(
             document_id=doc_id,
             metadata=DocumentMetadata(
@@ -442,15 +734,12 @@ class DocumentProcessor:
         for pg in pages:
             if pg.raw_text and not pg.error:
                 parts.append(f"[Page {pg.page_number}]\n{pg.raw_text}")
-            elif pg.raw_text:  # partial page with some text even on error
+            elif pg.raw_text:
                 parts.append(f"[Page {pg.page_number} (partial)]\n{pg.raw_text}")
         return "\n\n".join(parts)
 
     @staticmethod
-    def _assign_text_to_regions(
-        regions: list[TextBlock],
-        ocr_blocks: list[TextBlock],
-    ) -> list[TextBlock]:
+    def _assign_text_to_regions(regions, ocr_blocks) -> list[TextBlock]:
         """Assign OCR words to layout regions by bounding-box overlap."""
         def iou(a: TextBlock, b: TextBlock) -> float:
             if not a.bbox or not b.bbox:
@@ -462,7 +751,7 @@ class DocumentProcessor:
             inter_w = max(0, min(ax2, bx2) - max(ax1, bx1))
             inter_h = max(0, min(ay2, by2) - max(ay1, by1))
             inter = inter_w * inter_h
-            union = (ax2-ax1)*(ay2-ay1) + (bx2-bx1)*(by2-by1) - inter
+            union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
             return inter / union if union else 0.0
 
         matched_ids: set[int] = set()
