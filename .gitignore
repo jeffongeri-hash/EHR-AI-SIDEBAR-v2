@@ -21,10 +21,13 @@ node_modules/
 frontend/dist/
 frontend/.vite/
 
-# Data & Models (large files)
+# Data & Models (large files — model weights, not Python packages)
 uploads/
-models/
+/models/
 datasets/
+# Allow the Python models package (schemas, not weights)
+!backend/app/models/
+!backend/app/models/**
 *.bin
 *.safetensors
 *.gguf

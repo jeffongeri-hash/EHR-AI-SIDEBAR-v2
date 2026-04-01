@@ -50,7 +50,9 @@ class MessageRole(str, Enum):
 
 class FineTuneStatus(str, Enum):
     QUEUED = "queued"
-    TRAINING = "training"
+    PENDING = "pending"       # job accepted, not yet started
+    RUNNING = "running"       # actively training
+    TRAINING = "training"     # alias for RUNNING
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -164,7 +166,9 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     model_name: Optional[str] = None
-    model_provider: ModelProvider = ModelProvider.CLAUDE
+    # Default to LOCAL_HF so open-source models are tried first.
+    # Claude is only used as an automatic fallback if the local provider fails.
+    model_provider: ModelProvider = ModelProvider.LOCAL_HF
     system_prompt: Optional[str] = None
     temperature: float = 0.7
     max_tokens: int = 2048
@@ -179,6 +183,9 @@ class ChatResponse(BaseModel):
     model_used: str = ""
     usage: Dict[str, Any] = Field(default_factory=dict)
     document_context: Optional[List[str]] = None
+    # Transparency fields — always tell the frontend which provider answered
+    provider_used: str = ""       # e.g. "local_hf", "ollama", "claude"
+    claude_used: bool = False     # True when Claude was used as fallback
 
 
 class ConversationHistory(BaseModel):
