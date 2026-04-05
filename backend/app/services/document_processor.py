@@ -89,6 +89,216 @@ def _clean_medical_text(text: str) -> str:
     return "\n".join(lines)
 
 
+# ── Perspective / dewarp correction ──────────────────────────────────────────
+
+def _dewarp_perspective(img):
+    """
+    Correct perspective distortion from phone-photographed medical documents.
+
+    When a user photographs a document at an angle, the page appears as a
+    trapezoid.  This function:
+      1. Detects strong edges via a Sobel-like filter.
+      2. Uses a Hough-line approach (pure PIL/numpy) to find the four dominant
+         page edges.
+      3. Computes the four corner intersections.
+      4. Applies a perspective transform (homography) to produce a flat,
+         rectangular image.
+
+    Falls back silently to the original image on any error or if the page
+    already appears rectangular (skew < 3 degrees on all edges).
+    """
+    try:
+        from PIL import Image as PilImage, ImageFilter
+
+        w, h = img.size
+
+        # ── Step 1: Edge map via Sobel approximation ──────────────────────
+        gray = img.convert("L")
+
+        # Horizontal and vertical Sobel kernels
+        sobel_x = gray.filter(ImageFilter.Kernel(
+            size=3, kernel=[-1, 0, 1, -2, 0, 2, -1, 0, 1], scale=1, offset=128
+        ))
+        sobel_y = gray.filter(ImageFilter.Kernel(
+            size=3, kernel=[-1, -2, -1, 0, 0, 0, 1, 2, 1], scale=1, offset=128
+        ))
+
+        sx = list(sobel_x.getdata())
+        sy = list(sobel_y.getdata())
+        edge_mag = [
+            min(255, int((((sx[i] - 128) ** 2 + (sy[i] - 128) ** 2) ** 0.5)))
+            for i in range(w * h)
+        ]
+
+        # ── Step 2: Hough line accumulator (theta 0–179°, r sampled) ─────
+        import math
+
+        diag = int((w ** 2 + h ** 2) ** 0.5)
+        thetas = [t * math.pi / 180 for t in range(180)]
+        cos_t = [math.cos(t) for t in thetas]
+        sin_t = [math.sin(t) for t in thetas]
+
+        # Only vote with strong edge pixels (mag > 100) — sample every 3rd
+        accumulator: dict[tuple[int, int], int] = {}
+        edge_threshold = 110
+        for idx in range(0, w * h, 3):
+            if edge_mag[idx] < edge_threshold:
+                continue
+            px, py = idx % w, idx // w
+            for t_idx in range(0, 180, 2):   # step 2° for speed
+                r = int(px * cos_t[t_idx] + py * sin_t[t_idx])
+                key = (t_idx, r)
+                accumulator[key] = accumulator.get(key, 0) + 1
+
+        if not accumulator:
+            return img
+
+        # ── Step 3: Extract top lines, cluster into 4 page edges ─────────
+        sorted_lines = sorted(accumulator.items(), key=lambda x: -x[1])
+
+        # Non-maximum suppression: keep lines far enough apart
+        kept: list[tuple[int, int]] = []
+        for (t_idx, r), votes in sorted_lines:
+            if votes < 15:
+                break
+            # Check if too close to an already-kept line
+            duplicate = False
+            for (kt, kr) in kept:
+                if abs(t_idx - kt) < 10 and abs(r - kr) < int(min(w, h) * 0.08):
+                    duplicate = True
+                    break
+            if not duplicate:
+                kept.append((t_idx, r))
+            if len(kept) >= 12:
+                break
+
+        if len(kept) < 4:
+            return img  # not enough structure to dewarp
+
+        # Convert (theta, r) → line endpoints
+        def hough_to_segment(t_idx, r, length=max(w, h) * 2):
+            t = thetas[t_idx]
+            cos_v, sin_v = cos_t[t_idx], sin_t[t_idx]
+            x0 = cos_v * r - sin_v * length
+            y0 = sin_v * r + cos_v * length
+            x1 = cos_v * r + sin_v * length
+            y1 = sin_v * r - cos_v * length
+            return (x0, y0, x1, y1)
+
+        def line_intersection(l1, l2):
+            """Return intersection point of two lines given as (x0,y0,x1,y1)."""
+            x1, y1, x2, y2 = l1
+            x3, y3, x4, y4 = l2
+            denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+            if abs(denom) < 1e-6:
+                return None
+            t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+            return (x1 + t * (x2 - x1), y1 + t * (y2 - y1))
+
+        segments = [hough_to_segment(t, r) for (t, r) in kept]
+
+        # Separate into roughly horizontal (t 60°–120°) and vertical (t 0–30° or 150°–180°)
+        horiz = [(t, r) for (t, r) in kept if 55 <= t <= 125]
+        vert  = [(t, r) for (t, r) in kept if t < 35 or t > 145]
+
+        if len(horiz) < 2 or len(vert) < 2:
+            return img
+
+        # Sort: horizontal by r (top first), vertical by r (left first)
+        horiz_sorted = sorted(horiz, key=lambda x: x[1])
+        vert_sorted  = sorted(vert,  key=lambda x: x[1])
+
+        top_line    = hough_to_segment(*horiz_sorted[0])
+        bottom_line = hough_to_segment(*horiz_sorted[-1])
+        left_line   = hough_to_segment(*vert_sorted[0])
+        right_line  = hough_to_segment(*vert_sorted[-1])
+
+        # ── Step 4: Find four corners ─────────────────────────────────────
+        tl = line_intersection(top_line, left_line)
+        tr = line_intersection(top_line, right_line)
+        bl = line_intersection(bottom_line, left_line)
+        br = line_intersection(bottom_line, right_line)
+
+        if None in (tl, tr, bl, br):
+            return img
+
+        # Sanity: all corners must be near the image (within 30% outside)
+        margin = 0.3
+        for cx, cy in (tl, tr, bl, br):
+            if cx < -w * margin or cx > w * (1 + margin):
+                return img
+            if cy < -h * margin or cy > h * (1 + margin):
+                return img
+
+        # Skip if already rectangular (all corners within 3% of image bounds)
+        def near_rect():
+            corners = [(tl, (0, 0)), (tr, (w, 0)), (bl, (0, h)), (br, (w, h))]
+            for (cx, cy), (ex, ey) in corners:
+                if abs(cx - ex) > w * 0.03 or abs(cy - ey) > h * 0.03:
+                    return False
+            return True
+
+        if near_rect():
+            logger.debug("Page already rectangular — skipping dewarp")
+            return img
+
+        # ── Step 5: Perspective transform using PIL transform ─────────────
+        # Output size: use the longer of the two horizontal / vertical spans
+        out_w = int(max(
+            ((tr[0] - tl[0]) ** 2 + (tr[1] - tl[1]) ** 2) ** 0.5,
+            ((br[0] - bl[0]) ** 2 + (br[1] - bl[1]) ** 2) ** 0.5,
+        ))
+        out_h = int(max(
+            ((bl[0] - tl[0]) ** 2 + (bl[1] - tl[1]) ** 2) ** 0.5,
+            ((br[0] - tr[0]) ** 2 + (br[1] - tr[1]) ** 2) ** 0.5,
+        ))
+
+        if out_w < 100 or out_h < 100:
+            return img
+
+        # PIL's PERSPECTIVE transform needs 8-coefficient matrix.
+        # We compute it via solving the linear system for the mapping:
+        #   src corners → dst corners (rectangle)
+        src = [tl[0], tl[1], tr[0], tr[1], br[0], br[1], bl[0], bl[1]]
+        dst = [0, 0, out_w, 0, out_w, out_h, 0, out_h]
+
+        def _find_coeffs(src_pts, dst_pts):
+            import numpy as np
+            matrix = []
+            for (sx, sy), (dx, dy) in zip(
+                [(src_pts[i*2], src_pts[i*2+1]) for i in range(4)],
+                [(dst_pts[i*2], dst_pts[i*2+1]) for i in range(4)],
+            ):
+                matrix.append([dx, dy, 1, 0, 0, 0, -sx * dx, -sx * dy])
+                matrix.append([0, 0, 0, dx, dy, 1, -sy * dx, -sy * dy])
+            A = np.array(matrix, dtype=float)
+            b = np.array(src_pts, dtype=float)
+            res = np.linalg.lstsq(A, b, rcond=None)[0]
+            return list(res)
+
+        try:
+            coeffs = _find_coeffs(src, dst)
+            dewarped = img.transform(
+                (out_w, out_h),
+                PilImage.PERSPECTIVE,
+                coeffs,
+                PilImage.BICUBIC,
+            )
+            logger.info(
+                f"Dewarp applied: ({w}×{h}) → ({out_w}×{out_h}) "
+                f"corners TL={tl} TR={tr} BL={bl} BR={br}"
+            )
+            return dewarped
+        except ImportError:
+            # numpy not available — skip transform
+            logger.debug("Dewarp skipped: numpy not available")
+            return img
+
+    except Exception as exc:
+        logger.debug(f"Dewarp failed (using original): {exc}")
+        return img
+
+
 # ── Image enhancement for medical scans ──────────────────────────────────────
 
 def _upscale_if_needed(img, min_width: int = 1400):
@@ -881,6 +1091,7 @@ def _enhance_medical_image(img):
     try:
         from PIL import ImageEnhance, ImageFilter, ImageOps
 
+        img = _dewarp_perspective(img)   # fix phone-photo trapezoid distortion
         img = _remove_scanner_borders(img)
         img = _remove_stamps(img)        # remove CONFIDENTIAL/RECEIVED overlays
         img = _upscale_if_needed(img)
