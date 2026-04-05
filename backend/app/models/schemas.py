@@ -135,8 +135,10 @@ class DocumentPage(BaseModel):
     column_count: int = 1
     checkboxes: List[Dict[str, Any]] = Field(default_factory=list)
     image_quality: Optional[Dict[str, Any]] = None       # blur, contrast, brightness, warnings
-    handwriting_regions: List[Dict[str, Any]] = Field(default_factory=list)  # detected HW regions
-    has_handwriting: bool = False                         # True if any handwritten region found
+    handwriting_regions: List[Dict[str, Any]] = Field(default_factory=list)
+    has_handwriting: bool = False
+    chart_regions: List[Dict[str, Any]] = Field(default_factory=list)  # {x1,y1,x2,y2,chart_type,title}
+    has_charts: bool = False
 
 
 class ProcessedDocument(BaseModel):
