@@ -1521,6 +1521,250 @@ def _auto_rotate(img):
     return img, 0
 
 
+# ── Chart and graph detection ────────────────────────────────────────────────
+
+# Chart type signatures: (name, min_edge_density, max_text_ratio, notes)
+# edge_density  = fraction of pixels that are strong edges
+# text_ratio    = fraction of tile area covered by high-confidence OCR words
+_CHART_TYPES = [
+    # EKG/ECG: very high edge density, near-zero text, repeating waveform
+    ("ekg_ecg",        0.18, 0.05,  "Electrocardiogram tracing"),
+    # Line/vital-sign graph: moderate-high edge density, low text
+    ("line_graph",     0.12, 0.10,  "Line graph / vital signs trend"),
+    # Bar chart: moderate edge density, colour variation, low text in chart body
+    ("bar_chart",      0.08, 0.12,  "Bar or histogram chart"),
+    # Pie/donut: low edge density but high colour variance, circular shape
+    ("pie_chart",      0.04, 0.10,  "Pie or donut chart"),
+    # Anatomy / figure: large non-text image region, low edge density
+    ("figure_diagram", 0.03, 0.06,  "Anatomical figure or diagram"),
+]
+
+# Tile grid size for spatial analysis
+_TILE_COLS = 16
+_TILE_ROWS = 20
+
+
+def _detect_chart_regions(img) -> list[dict]:
+    """
+    Detect chart, graph, and figure regions in a medical document image.
+
+    Algorithm (tile-based, no OpenCV required):
+      1. Divide the image into a TILE_ROWS × TILE_COLS grid.
+      2. For each tile compute:
+           edge_density  — fraction of pixels with strong Sobel edges
+           colour_var    — standard deviation of pixel values (visual complexity)
+           text_coverage — fraction of tile covered by high-confidence Tesseract words
+      3. Tiles with high edge_density AND low text_coverage are chart candidates.
+      4. Flood-fill adjacent candidate tiles into contiguous regions.
+      5. Filter regions by minimum size (>2% of page).
+      6. Classify each region into a chart type.
+      7. Extract the chart title from text immediately above the region.
+
+    Returns list of dicts:
+      {x1, y1, x2, y2, chart_type, chart_type_label, title, confidence,
+       tile_count, edge_density_mean, text_coverage_mean}
+    """
+    results: list[dict] = []
+    try:
+        from PIL import ImageFilter
+
+        w, h = img.size
+        tile_w = max(1, w // _TILE_COLS)
+        tile_h = max(1, h // _TILE_ROWS)
+
+        # ── Build edge map ────────────────────────────────────────────────
+        gray = img.convert("L")
+        sx = gray.filter(ImageFilter.Kernel(
+            size=3, kernel=[-1, 0, 1, -2, 0, 2, -1, 0, 1], scale=1, offset=128
+        ))
+        sy = gray.filter(ImageFilter.Kernel(
+            size=3, kernel=[-1, -2, -1, 0, 0, 0, 1, 2, 1], scale=1, offset=128
+        ))
+        sx_d = list(sx.getdata())
+        sy_d = list(sy.getdata())
+        edge = [
+            1 if ((sx_d[i] - 128) ** 2 + (sy_d[i] - 128) ** 2) ** 0.5 > 40 else 0
+            for i in range(w * h)
+        ]
+        gray_d = list(gray.getdata())
+
+        # ── Get Tesseract word boxes for text coverage ────────────────────
+        word_mask = [0] * (w * h)   # 1 = pixel covered by a confident word bbox
+        try:
+            import pytesseract
+            data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+            for i in range(len(data["text"])):
+                if int(data["conf"][i]) < 50:
+                    continue
+                wx, wy = data["left"][i], data["top"][i]
+                ww, wh = data["width"][i], data["height"][i]
+                for ry in range(max(0, wy), min(h, wy + wh)):
+                    for rx in range(max(0, wx), min(w, wx + ww)):
+                        word_mask[ry * w + rx] = 1
+        except Exception:
+            pass   # word_mask stays all-zero; text_coverage will be 0 for all tiles
+
+        # ── Per-tile metrics ──────────────────────────────────────────────
+        # tile_flags[row][col] = (edge_density, colour_var, text_coverage)
+        tile_edge   = [[0.0] * _TILE_COLS for _ in range(_TILE_ROWS)]
+        tile_colvar = [[0.0] * _TILE_COLS for _ in range(_TILE_ROWS)]
+        tile_text   = [[0.0] * _TILE_COLS for _ in range(_TILE_ROWS)]
+
+        for row in range(_TILE_ROWS):
+            for col in range(_TILE_COLS):
+                x1t = col * tile_w
+                y1t = row * tile_h
+                x2t = min(w, x1t + tile_w)
+                y2t = min(h, y1t + tile_h)
+
+                idxs = [
+                    y * w + x
+                    for y in range(y1t, y2t)
+                    for x in range(x1t, x2t)
+                    if y * w + x < w * h
+                ]
+                if not idxs:
+                    continue
+
+                n = len(idxs)
+                ed = sum(edge[i]      for i in idxs) / n
+                tc = sum(word_mask[i] for i in idxs) / n
+
+                pvals = [gray_d[i] for i in idxs]
+                mean_p = sum(pvals) / n
+                cv = (sum((p - mean_p) ** 2 for p in pvals) / n) ** 0.5
+
+                tile_edge[row][col]   = ed
+                tile_colvar[row][col] = cv
+                tile_text[row][col]   = tc
+
+        # ── Mark candidate tiles ──────────────────────────────────────────
+        # A tile is a chart candidate if edge_density is notable AND text is sparse
+        candidate = [
+            [
+                tile_edge[r][c] > 0.06 and tile_text[r][c] < 0.15
+                for c in range(_TILE_COLS)
+            ]
+            for r in range(_TILE_ROWS)
+        ]
+
+        # ── Flood-fill adjacent candidates into regions ───────────────────
+        visited = [[False] * _TILE_COLS for _ in range(_TILE_ROWS)]
+        regions_tiles: list[list[tuple[int, int]]] = []
+
+        def flood_tiles(start_r, start_c):
+            stack = [(start_r, start_c)]
+            group: list[tuple[int, int]] = []
+            while stack:
+                r, c = stack.pop()
+                if r < 0 or r >= _TILE_ROWS or c < 0 or c >= _TILE_COLS:
+                    continue
+                if visited[r][c] or not candidate[r][c]:
+                    continue
+                visited[r][c] = True
+                group.append((r, c))
+                stack += [(r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)]
+            return group
+
+        for row in range(_TILE_ROWS):
+            for col in range(_TILE_COLS):
+                if candidate[row][col] and not visited[row][col]:
+                    grp = flood_tiles(row, col)
+                    if len(grp) >= 2:    # at least 2 adjacent tiles
+                        regions_tiles.append(grp)
+
+        # ── Convert tile groups → pixel regions ───────────────────────────
+        page_area = w * h
+        for grp in regions_tiles:
+            rows_ = [r for r, _ in grp]
+            cols_ = [c for _, c in grp]
+            x1r = min(cols_) * tile_w
+            y1r = min(rows_) * tile_h
+            x2r = min(w, (max(cols_) + 1) * tile_w)
+            y2r = min(h, (max(rows_) + 1) * tile_h)
+
+            region_area = (x2r - x1r) * (y2r - y1r)
+            if region_area < page_area * 0.02:   # too small
+                continue
+            if region_area > page_area * 0.92:   # almost whole page = not a chart
+                continue
+
+            # Mean metrics for this region
+            mean_edge = sum(tile_edge[r][c] for r, c in grp) / len(grp)
+            mean_text = sum(tile_text[r][c] for r, c in grp) / len(grp)
+            mean_cv   = sum(tile_colvar[r][c] for r, c in grp) / len(grp)
+
+            # ── Classify chart type ───────────────────────────────────────
+            chart_type, chart_label = "figure_diagram", "Figure / diagram"
+            best_match_score = 0.0
+            for ct_name, min_edge, max_text, ct_label in _CHART_TYPES:
+                if mean_edge >= min_edge and mean_text <= max_text:
+                    # Higher edge density = better match for edge-heavy types
+                    match_score = mean_edge / max(min_edge, 0.001)
+                    if match_score > best_match_score:
+                        best_match_score = match_score
+                        chart_type, chart_label = ct_name, ct_label
+
+            # Confidence: how far above the edge density threshold
+            confidence = round(min(1.0, mean_edge / 0.20), 2)
+
+            # ── Extract title from text immediately above region ──────────
+            title = ""
+            try:
+                title_crop_y1 = max(0, y1r - int(tile_h * 2.5))
+                title_crop_y2 = y1r
+                if title_crop_y2 > title_crop_y1:
+                    title_crop = img.crop((x1r, title_crop_y1, x2r, title_crop_y2))
+                    import pytesseract
+                    raw = pytesseract.image_to_string(
+                        title_crop, config="--psm 7"
+                    ).strip()
+                    if raw and len(raw) < 120:
+                        title = raw
+            except Exception:
+                pass
+
+            results.append({
+                "x1": x1r, "y1": y1r, "x2": x2r, "y2": y2r,
+                "chart_type": chart_type,
+                "chart_type_label": chart_label,
+                "title": title,
+                "confidence": confidence,
+                "tile_count": len(grp),
+                "edge_density_mean": round(mean_edge, 3),
+                "text_coverage_mean": round(mean_text, 3),
+            })
+
+        if results:
+            logger.info(
+                f"Detected {len(results)} chart region(s): "
+                + ", ".join(r["chart_type"] for r in results)
+            )
+
+    except Exception as exc:
+        logger.debug(f"Chart detection failed: {exc}")
+
+    return results
+
+
+def _chart_regions_to_text(chart_regions: list[dict]) -> str:
+    """
+    Produce a human-readable summary of detected chart regions for the LLM.
+    The LLM needs to know a chart exists even though its content wasn't OCR'd.
+    """
+    if not chart_regions:
+        return ""
+    lines = ["[Visual content detected — not transcribed]"]
+    for i, cr in enumerate(chart_regions, 1):
+        title = f' — "{cr["title"]}"' if cr.get("title") else ""
+        conf = int(cr["confidence"] * 100)
+        lines.append(
+            f"  Chart {i}: {cr['chart_type_label']}{title} "
+            f"(confidence {conf}%, region ({cr['x1']},{cr['y1']})–({cr['x2']},{cr['y2']}))"
+        )
+    return "\n".join(lines)
+
+
 # ── Document type classification ─────────────────────────────────────────────
 
 from app.models.schemas import MedicalDocumentType
@@ -1935,6 +2179,13 @@ class DocumentProcessor:
             if has_hw:
                 clean_text = _apply_trocr_to_regions(img, hw_regions, clean_text)
 
+            # ── Chart and graph detection ──────────────────────────────────
+            chart_regions = _detect_chart_regions(img)
+            has_charts = len(chart_regions) > 0
+            chart_text = _chart_regions_to_text(chart_regions)
+            if chart_text:
+                clean_text = clean_text + "\n\n" + chart_text
+
             return DocumentPage(
                 page_number=page_idx + 1,
                 width=float(img.width),
@@ -1951,6 +2202,8 @@ class DocumentProcessor:
                 image_quality=quality,
                 handwriting_regions=hw_regions,
                 has_handwriting=has_hw,
+                chart_regions=chart_regions,
+                has_charts=has_charts,
             )
 
         except MemoryError:
@@ -2365,6 +2618,13 @@ class DocumentProcessor:
             if has_hw:
                 text = _apply_trocr_to_regions(img, hw_regions, text)
 
+            # ── Chart and graph detection ──────────────────────────────────
+            chart_regions = _detect_chart_regions(img)
+            has_charts = len(chart_regions) > 0
+            chart_text = _chart_regions_to_text(chart_regions)
+            if chart_text:
+                text = text + "\n\n" + chart_text
+
             return DocumentPage(
                 page_number=frame_idx + 1,
                 width=float(img.width),
@@ -2381,6 +2641,8 @@ class DocumentProcessor:
                 image_quality=quality,
                 handwriting_regions=hw_regions,
                 has_handwriting=has_hw,
+                chart_regions=chart_regions,
+                has_charts=has_charts,
             )
 
         except Exception as exc:
