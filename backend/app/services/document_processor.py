@@ -1206,6 +1206,261 @@ def _assess_image_quality(img) -> dict:
         return {"grade": "unknown", "warnings": []}
 
 
+# ── Handwriting detection + TrOCR ────────────────────────────────────────────
+
+# Lazy-loaded TrOCR singleton — loaded once, reused across pages
+_trocr_processor = None
+_trocr_model = None
+_trocr_load_attempted = False
+
+# Heuristic thresholds for handwriting detection
+_HW_HEIGHT_CV   = 0.22   # coefficient of variation in word heights
+_HW_BASELINE_CV = 0.14   # variation in word baseline y positions
+_HW_SPACING_CV  = 0.30   # variation in inter-word spacing
+_HW_MIN_WORDS   = 4      # need at least this many words to make a judgement
+
+
+def _load_trocr():
+    """
+    Lazy-load Microsoft TrOCR handwritten model.
+    Uses microsoft/trocr-base-handwritten (~400 MB).
+    Only attempted once per process — failure is cached silently.
+    """
+    global _trocr_processor, _trocr_model, _trocr_load_attempted
+    if _trocr_load_attempted:
+        return _trocr_processor is not None
+    _trocr_load_attempted = True
+    try:
+        from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+        logger.info("Loading TrOCR handwriting model (first use — one-time download ~400 MB)…")
+        _trocr_processor = TrOCRProcessor.from_pretrained(
+            "microsoft/trocr-base-handwritten"
+        )
+        _trocr_model = VisionEncoderDecoderModel.from_pretrained(
+            "microsoft/trocr-base-handwritten"
+        )
+        _trocr_model.eval()
+        logger.info("TrOCR loaded successfully")
+        return True
+    except Exception as exc:
+        logger.warning(f"TrOCR unavailable: {exc}. Handwritten regions will use Tesseract.")
+        return False
+
+
+def _trocr_transcribe_line(line_img) -> str:
+    """
+    Transcribe a single line image using TrOCR.
+    Returns empty string if model is unavailable.
+    """
+    if not _load_trocr():
+        return ""
+    try:
+        import torch
+        pixel_values = _trocr_processor(
+            images=line_img.convert("RGB"),
+            return_tensors="pt",
+        ).pixel_values
+        with torch.no_grad():
+            ids = _trocr_model.generate(pixel_values)
+        text = _trocr_processor.batch_decode(ids, skip_special_tokens=True)[0]
+        return text.strip()
+    except Exception as exc:
+        logger.debug(f"TrOCR inference failed: {exc}")
+        return ""
+
+
+def _detect_handwriting_regions(img) -> list[dict]:
+    """
+    Detect handwritten regions in a document image using word-level
+    bounding box statistics from Tesseract.
+
+    Handwriting characteristics (vs printed text):
+      - Variable word heights  (coefficient of variation > 0.22)
+      - Irregular baselines    (words don't sit on a consistent y baseline)
+      - Uneven inter-word gaps (spacing is more irregular)
+
+    Returns a list of region dicts:
+      {x1, y1, x2, y2, is_handwritten, confidence, word_count}
+
+    Regions are grouped by Tesseract paragraph/block boundaries.
+    """
+    regions: list[dict] = []
+    try:
+        import pytesseract
+
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+        n = len(data["text"])
+
+        # Group words by (block_num, par_num)
+        groups: dict[tuple, list[dict]] = {}
+        for i in range(n):
+            word = str(data["text"][i]).strip()
+            conf = int(data["conf"][i])
+            if not word or conf < 20:
+                continue
+            key = (data["block_num"][i], data["par_num"][i])
+            groups.setdefault(key, []).append({
+                "text": word,
+                "x":  data["left"][i],
+                "y":  data["top"][i],
+                "w":  data["width"][i],
+                "h":  data["height"][i],
+            })
+
+        for key, words in groups.items():
+            if len(words) < _HW_MIN_WORDS:
+                continue
+
+            heights   = [w["h"] for w in words]
+            baselines = [w["y"] + w["h"] for w in words]
+            sorted_x  = sorted(words, key=lambda w: w["x"])
+            spacings  = [
+                sorted_x[i + 1]["x"] - (sorted_x[i]["x"] + sorted_x[i]["w"])
+                for i in range(len(sorted_x) - 1)
+                if sorted_x[i + 1]["x"] - (sorted_x[i]["x"] + sorted_x[i]["w"]) > 0
+            ]
+
+            def cv(vals):
+                if not vals:
+                    return 0.0
+                mean = sum(vals) / len(vals)
+                if mean == 0:
+                    return 0.0
+                std = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5
+                return std / mean
+
+            h_cv  = cv(heights)
+            bl_cv = cv(baselines)
+            sp_cv = cv(spacings) if spacings else 0.0
+
+            # Score: weighted sum of the three CVs
+            score = h_cv * 0.5 + bl_cv * 0.35 + sp_cv * 0.15
+            is_hw = h_cv > _HW_HEIGHT_CV or bl_cv > _HW_BASELINE_CV
+
+            # Bounding box of the whole group
+            x1 = min(w["x"] for w in words)
+            y1 = min(w["y"] for w in words)
+            x2 = max(w["x"] + w["w"] for w in words)
+            y2 = max(w["y"] + w["h"] for w in words)
+
+            regions.append({
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "is_handwritten": is_hw,
+                "hw_score": round(score, 3),
+                "word_count": len(words),
+            })
+
+    except Exception as exc:
+        logger.debug(f"Handwriting detection failed: {exc}")
+
+    hw_count = sum(1 for r in regions if r["is_handwritten"])
+    if hw_count:
+        logger.info(f"Detected {hw_count} handwritten region(s) out of {len(regions)}")
+
+    return regions
+
+
+def _apply_trocr_to_regions(img, regions: list[dict], existing_text: str) -> str:
+    """
+    For each handwritten region, run TrOCR and splice the result into the
+    existing OCR text.
+
+    Strategy:
+      1. For each handwritten region crop:
+         a. Split into horizontal lines by projecting dark-pixel density.
+         b. Run TrOCR on each line crop.
+         c. Collect the TrOCR transcript.
+      2. Append all handwritten transcripts to the text as a clearly
+         labelled section so the LLM knows the source.
+
+    Returns the augmented text string.
+    """
+    if not any(r["is_handwritten"] for r in regions):
+        return existing_text
+
+    if not _load_trocr():
+        return existing_text
+
+    from PIL import Image as PilImage
+
+    hw_texts: list[str] = []
+    w_img, h_img = img.size
+
+    for region in regions:
+        if not region["is_handwritten"]:
+            continue
+        try:
+            x1, y1 = max(0, region["x1"] - 4), max(0, region["y1"] - 4)
+            x2, y2 = min(w_img, region["x2"] + 4), min(h_img, region["y2"] + 4)
+            crop = img.crop((x1, y1, x2, y2))
+
+            # Split crop into text lines via horizontal projection
+            lines = _split_into_lines(crop)
+
+            region_lines: list[str] = []
+            for line_crop in lines:
+                if line_crop.width < 20 or line_crop.height < 8:
+                    continue
+                text = _trocr_transcribe_line(line_crop)
+                if text:
+                    region_lines.append(text)
+
+            if region_lines:
+                hw_texts.append("\n".join(region_lines))
+
+        except Exception as exc:
+            logger.debug(f"TrOCR region processing failed: {exc}")
+
+    if hw_texts:
+        hw_block = "\n\n[Handwritten notes — transcribed by TrOCR]\n" + "\n---\n".join(hw_texts)
+        return existing_text + hw_block
+
+    return existing_text
+
+
+def _split_into_lines(img, min_gap: int = 4) -> list:
+    """
+    Split an image into individual text line crops using a horizontal
+    projection profile (sum of dark pixels per row).
+
+    Rows with very few dark pixels = line gaps.
+    Returns list of PIL Image crops, one per line.
+    """
+    try:
+        gray = img.convert("L")
+        pixels = list(gray.getdata())
+        w, h = gray.size
+
+        # Dark pixel count per row
+        row_dark = [
+            sum(1 for x in range(w) if pixels[y * w + x] < 140)
+            for y in range(h)
+        ]
+
+        # Find line extents: runs of rows with dark content
+        in_line, line_start = False, 0
+        lines: list[tuple[int, int]] = []
+        for y, dark in enumerate(row_dark):
+            if dark > 1:
+                if not in_line:
+                    in_line, line_start = True, y
+            else:
+                if in_line:
+                    if y - line_start >= min_gap:
+                        lines.append((line_start, y))
+                    in_line = False
+        if in_line:
+            lines.append((line_start, h))
+
+        if not lines:
+            return [img]
+
+        return [img.crop((0, y1, w, y2)) for y1, y2 in lines]
+
+    except Exception:
+        return [img]
+
+
 def _enhance_medical_image(img, quality: dict | None = None):
     """
     Full enhancement pipeline for medical document images:
@@ -1476,6 +1731,12 @@ class DocumentProcessor:
             if checkbox_text:
                 clean_text = clean_text + "\n\n" + checkbox_text
 
+            # Handwriting detection + TrOCR transcription
+            hw_regions = _detect_handwriting_regions(img)
+            has_hw = any(r["is_handwritten"] for r in hw_regions)
+            if has_hw:
+                clean_text = _apply_trocr_to_regions(img, hw_regions, clean_text)
+
             return DocumentPage(
                 page_number=page_idx + 1,
                 width=float(img.width),
@@ -1490,6 +1751,8 @@ class DocumentProcessor:
                 column_count=col_count,
                 checkboxes=checkboxes,
                 image_quality=quality,
+                handwriting_regions=hw_regions,
+                has_handwriting=has_hw,
             )
 
         except MemoryError:
@@ -1898,6 +2161,12 @@ class DocumentProcessor:
             if checkbox_text:
                 text = text + "\n\n" + checkbox_text
 
+            # ── Handwriting detection + TrOCR ─────────────────────────────
+            hw_regions = _detect_handwriting_regions(img)
+            has_hw = any(r["is_handwritten"] for r in hw_regions)
+            if has_hw:
+                text = _apply_trocr_to_regions(img, hw_regions, text)
+
             return DocumentPage(
                 page_number=frame_idx + 1,
                 width=float(img.width),
@@ -1912,6 +2181,8 @@ class DocumentProcessor:
                 column_count=col_count,
                 checkboxes=checkboxes,
                 image_quality=quality,
+                handwriting_regions=hw_regions,
+                has_handwriting=has_hw,
             )
 
         except Exception as exc:
