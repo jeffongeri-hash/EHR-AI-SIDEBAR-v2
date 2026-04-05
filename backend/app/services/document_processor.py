@@ -580,6 +580,130 @@ def _checkboxes_to_text(checkboxes: list[dict]) -> str:
 
 # ── Image enhancement for medical scans ──────────────────────────────────────
 
+# ── Image quality assessment ──────────────────────────────────────────────────
+
+# Thresholds — tuned for medical document scanning conditions
+_BLUR_WARN      = 80.0    # Laplacian variance below this = blurry
+_BLUR_FAIL      = 20.0    # below this = too blurry for reliable OCR
+_CONTRAST_WARN  = 40.0    # std-dev of pixel values below this = low contrast
+_BRIGHTNESS_LOW = 50.0    # mean pixel value below this = too dark
+_BRIGHTNESS_HI  = 230.0   # mean pixel value above this = overexposed
+_NOISE_WARN     = 18.0    # noise estimate above this = noisy scan
+
+
+def _assess_image_quality(img) -> dict:
+    """
+    Score an image on four medical-relevant quality dimensions before OCR:
+
+      blur_score      — Laplacian variance; higher = sharper
+      contrast_score  — pixel std-dev; higher = more contrast
+      brightness      — mean pixel value (0=black, 255=white)
+      noise_score     — estimated noise level via difference filter
+
+    Returns a dict with numeric scores, a grade (good/warn/poor),
+    and a human-readable list of warnings suitable for the UI.
+    """
+    try:
+        from PIL import ImageFilter
+
+        gray = img.convert("L")
+        pixels = list(gray.getdata())
+        n = len(pixels)
+        if n == 0:
+            return {"grade": "unknown", "warnings": []}
+
+        # ── Brightness ────────────────────────────────────────────────────
+        brightness = sum(pixels) / n
+
+        # ── Contrast (standard deviation of pixel values) ─────────────────
+        mean = brightness
+        variance = sum((p - mean) ** 2 for p in pixels) / n
+        contrast_score = variance ** 0.5
+
+        # ── Blur (Laplacian variance) ─────────────────────────────────────
+        # Apply Laplacian edge filter; high variance = sharp edges = not blurry
+        lap = gray.filter(ImageFilter.Kernel(
+            size=3,
+            kernel=[0, 1, 0, 1, -4, 1, 0, 1, 0],
+            scale=1, offset=128,
+        ))
+        lap_pixels = list(lap.getdata())
+        lap_mean = sum(lap_pixels) / len(lap_pixels)
+        blur_score = sum((p - lap_mean) ** 2 for p in lap_pixels) / len(lap_pixels)
+
+        # ── Noise (mean absolute difference between adjacent pixels) ──────
+        w, h = gray.size
+        diffs = []
+        for y in range(0, h - 1, 4):      # sample every 4th row for speed
+            for x in range(0, w - 1, 4):
+                diffs.append(abs(pixels[y * w + x] - pixels[y * w + x + 1]))
+                diffs.append(abs(pixels[y * w + x] - pixels[(y + 1) * w + x]))
+        noise_score = sum(diffs) / len(diffs) if diffs else 0.0
+
+        # ── Warnings ──────────────────────────────────────────────────────
+        warnings: list[str] = []
+
+        if blur_score < _BLUR_FAIL:
+            warnings.append(
+                f"Image is too blurry for reliable OCR (blur={blur_score:.0f}). "
+                "Please rescan at 300 DPI or higher."
+            )
+        elif blur_score < _BLUR_WARN:
+            warnings.append(
+                f"Image is slightly blurry (blur={blur_score:.0f}). "
+                "OCR accuracy may be reduced."
+            )
+
+        if contrast_score < _CONTRAST_WARN:
+            warnings.append(
+                f"Low contrast detected (contrast={contrast_score:.0f}). "
+                "Document may be faded — consider increasing scanner brightness."
+            )
+
+        if brightness < _BRIGHTNESS_LOW:
+            warnings.append(
+                f"Image is too dark (brightness={brightness:.0f}/255). "
+                "Increase scanner exposure or use a higher-quality scan."
+            )
+        elif brightness > _BRIGHTNESS_HI:
+            warnings.append(
+                f"Image is overexposed (brightness={brightness:.0f}/255). "
+                "Reduce scanner brightness to reveal faint text."
+            )
+
+        if noise_score > _NOISE_WARN:
+            warnings.append(
+                f"High noise level detected (noise={noise_score:.1f}). "
+                "This may be a fax or photocopy — OCR may have errors."
+            )
+
+        # ── Grade ─────────────────────────────────────────────────────────
+        if blur_score < _BLUR_FAIL or contrast_score < _CONTRAST_WARN * 0.6:
+            grade = "poor"
+        elif warnings:
+            grade = "warn"
+        else:
+            grade = "good"
+
+        result = {
+            "grade": grade,
+            "blur_score": round(blur_score, 1),
+            "contrast_score": round(contrast_score, 1),
+            "brightness": round(brightness, 1),
+            "noise_score": round(noise_score, 1),
+            "warnings": warnings,
+        }
+
+        if warnings:
+            logger.warning(f"Image quality {grade.upper()}: {'; '.join(warnings)}")
+
+        return result
+
+    except Exception as exc:
+        logger.debug(f"Quality assessment failed: {exc}")
+        return {"grade": "unknown", "warnings": []}
+
+
 def _enhance_medical_image(img):
     """
     Full enhancement pipeline for medical document images:
@@ -793,6 +917,9 @@ class DocumentProcessor:
             dpi = 300 if retry < 2 else 400  # escalate DPI on retries
             img = self.layout_svc.render_pdf_page(path, page_idx, dpi=dpi)
 
+            # Quality check before enhancement so score reflects raw scan
+            quality = _assess_image_quality(img)
+
             # Enhance and auto-rotate medical scans
             if enhance:
                 img = _enhance_medical_image(img)
@@ -849,6 +976,7 @@ class DocumentProcessor:
                 header_metadata=header_meta,
                 column_count=col_count,
                 checkboxes=checkboxes,
+                image_quality=quality,
             )
 
         except MemoryError:
@@ -1201,6 +1329,9 @@ class DocumentProcessor:
                     confidence=1.0,
                 )
 
+            # ── Image quality assessment ──────────────────────────────────
+            quality = _assess_image_quality(img)
+
             if enhance:
                 img = _enhance_medical_image(img)
             img, rotation = _auto_rotate(img)
@@ -1267,6 +1398,7 @@ class DocumentProcessor:
                 header_metadata=header_meta,
                 column_count=col_count,
                 checkboxes=checkboxes,
+                image_quality=quality,
             )
 
         except Exception as exc:

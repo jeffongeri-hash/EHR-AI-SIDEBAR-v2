@@ -112,11 +112,12 @@ class DocumentPage(BaseModel):
     confidence: float = 1.0
     error: Optional[str] = None          # per-page error when partial success
     # Computer-vision enrichment fields
-    header_metadata: Dict[str, str] = Field(default_factory=dict)   # patient_name, dob, mrn, etc.
-    header_text: str = ""                # raw header band text
-    footer_text: str = ""                # raw footer band text
-    column_count: int = 1                # detected number of text columns
-    checkboxes: List[Dict[str, Any]] = Field(default_factory=list)  # {label, checked, x, y}
+    header_metadata: Dict[str, str] = Field(default_factory=dict)
+    header_text: str = ""
+    footer_text: str = ""
+    column_count: int = 1
+    checkboxes: List[Dict[str, Any]] = Field(default_factory=list)
+    image_quality: Optional[Dict[str, Any]] = None  # blur, contrast, brightness, warnings
 
 
 class ProcessedDocument(BaseModel):
