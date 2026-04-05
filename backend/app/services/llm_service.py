@@ -72,6 +72,15 @@ _CONTEXT_WINDOWS: dict[str, int] = {
     "phi3-mini": 4_096,
     "mistralai/Mistral-7B-Instruct-v0.3": 32_768,
     "mistral-7b": 32_768,
+    # Medical-specialised
+    "BioMistral/BioMistral-7B": 32_768,
+    "biomistral-7b": 32_768,
+    "epfl-llm/meditron-7b": 4_096,
+    "meditron-7b": 4_096,
+    "wanglab/ClinicalCamel-13B": 4_096,
+    "clinicalcamel-13b": 4_096,
+    "wanglab/ClinicalCamel-70B": 4_096,
+    "clinicalcamel-70b": 4_096,
 }
 _DEFAULT_CONTEXT_WINDOW = 8_192
 

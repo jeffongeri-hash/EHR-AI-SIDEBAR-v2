@@ -4,10 +4,16 @@ Local Model Service
 Unified service for running ANY HuggingFace causal-LM model locally.
 
 Supported out-of-the-box:
-  • TinyLlama/TinyLlama-1.1B-Chat-v1.0          (~2 GB RAM)  — fast, lightweight
-  • deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B   (~4 GB RAM)  — strong medical reasoning
-  • microsoft/Phi-3-mini-4k-instruct             (~8 GB RAM)  — excellent quality
-  • mistralai/Mistral-7B-Instruct-v0.3           (~5 GB 4-bit) — best quality local
+  • TinyLlama/TinyLlama-1.1B-Chat-v1.0          (~2 GB RAM)   — fast, lightweight
+  • deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B   (~4 GB RAM)   — strong medical reasoning
+  • microsoft/Phi-3-mini-4k-instruct             (~8 GB RAM)   — excellent quality
+  • mistralai/Mistral-7B-Instruct-v0.3           (~5 GB 4-bit) — best quality general local
+
+Medical-specialised models:
+  • BioMistral/BioMistral-7B                     (~5 GB 4-bit) — Mistral fine-tuned on PubMed Central
+  • epfl-llm/meditron-7b                         (~5 GB 4-bit) — EPFL, clinical guidelines + PubMed
+  • wanglab/ClinicalCamel-13B                    (~9 GB 4-bit) — Llama-2-13B, clinical notes
+  • wanglab/ClinicalCamel-70B                    (~40 GB 4-bit)— Llama-2-70B, strongest clinical model
   • Any other HuggingFace causal-LM model
 
 Features:
@@ -118,6 +124,47 @@ MODEL_CATALOGUE: Dict[str, Dict[str, Any]] = {
         "context_length": 32768,
         "description": "Mistral 7B — best quality among local models (4-bit)",
         "fine_tunable": True,
+    },
+    # ── Medical-specialised models ────────────────────────────────────────────
+    "biomistral-7b": {
+        "hf_id": "BioMistral/BioMistral-7B",
+        "display_name": "BioMistral 7B",
+        "size_gb": 4.5,
+        "min_ram_gb": 6,
+        "context_length": 32768,
+        "description": "Mistral fine-tuned on PubMed Central — strong biomedical terminology",
+        "fine_tunable": True,
+        "medical": True,
+    },
+    "meditron-7b": {
+        "hf_id": "epfl-llm/meditron-7b",
+        "display_name": "Meditron 7B",
+        "size_gb": 4.5,
+        "min_ram_gb": 6,
+        "context_length": 4096,
+        "description": "EPFL — trained on PubMed, clinical guidelines; best for EHR Q&A",
+        "fine_tunable": True,
+        "medical": True,
+    },
+    "clinicalcamel-13b": {
+        "hf_id": "wanglab/ClinicalCamel-13B",
+        "display_name": "ClinicalCamel 13B",
+        "size_gb": 9.0,
+        "min_ram_gb": 12,
+        "context_length": 4096,
+        "description": "Llama-2-13B fine-tuned on clinical notes — faster than 70B",
+        "fine_tunable": True,
+        "medical": True,
+    },
+    "clinicalcamel-70b": {
+        "hf_id": "wanglab/ClinicalCamel-70B",
+        "display_name": "ClinicalCamel 70B",
+        "size_gb": 40.0,
+        "min_ram_gb": 48,
+        "context_length": 4096,
+        "description": "Llama-2-70B fine-tuned on clinical notes — highest clinical accuracy",
+        "fine_tunable": False,
+        "medical": True,
     },
 }
 

@@ -1,9 +1,16 @@
 import React, { useEffect, useState } from 'react'
-import { ChevronDown, Cpu, Cloud, RefreshCw, Zap } from 'lucide-react'
+import { ChevronDown, Cpu, Cloud, RefreshCw, Zap, Stethoscope } from 'lucide-react'
 import clsx from 'clsx'
 import { chatApi } from '@/services/api'
 import { useApp } from '@/contexts/AppContext'
 import type { ModelInfo } from '@/types'
+
+// Models known to be medical-specialised
+const MEDICAL_MODEL_KEYS = new Set([
+  'biomistral-7b', 'meditron-7b', 'clinicalcamel-13b', 'clinicalcamel-70b',
+  'BioMistral/BioMistral-7B', 'epfl-llm/meditron-7b',
+  'wanglab/ClinicalCamel-13B', 'wanglab/ClinicalCamel-70B',
+])
 
 export default function ModelSelector() {
   const { state, dispatch } = useApp()
@@ -31,10 +38,38 @@ export default function ModelSelector() {
   }, {})
 
   const providerLabel: Record<string, string> = {
-    claude: '☁ Anthropic Claude',
-    ollama: '💻 Local (Ollama)',
+    claude:      '☁  Anthropic Claude',
+    ollama:      '💻 Local (Ollama)',
     huggingface: '🤗 HuggingFace',
-    tinyllama: '⚡ TinyLlama (Local)',
+    tinyllama:   '⚡ TinyLlama (Local)',
+    local_hf:    '🖥  Local HuggingFace',
+  }
+
+  // Split local_hf models into medical vs general for better UX
+  const medicalModels = state.availableModels.filter(
+    (m) => MEDICAL_MODEL_KEYS.has(m.name) || (m.description ?? '').toLowerCase().includes('medical')
+      || (m.description ?? '').toLowerCase().includes('clinical')
+      || (m.description ?? '').toLowerCase().includes('pubmed')
+  )
+  const medicalNames = new Set(medicalModels.map((m) => m.name))
+
+  const groupedProviders = Object.entries(byProvider).reduce<Record<string, ModelInfo[]>>(
+    (acc, [provider, models]) => {
+      if (provider === 'local_hf') {
+        const general = models.filter((m) => !medicalNames.has(m.name))
+        const medical = models.filter((m) =>  medicalNames.has(m.name))
+        if (general.length) acc['local_hf'] = general
+        if (medical.length) acc['medical'] = medical
+      } else {
+        acc[provider] = models
+      }
+      return acc
+    }, {}
+  )
+
+  const allProviderLabels: Record<string, string> = {
+    ...providerLabel,
+    medical: '🩺 Medical Specialised',
   }
 
   return (
@@ -77,64 +112,83 @@ export default function ModelSelector() {
           </div>
 
           <div className="max-h-80 overflow-y-auto py-1">
-            {Object.entries(byProvider).map(([provider, models]) => (
+            {Object.entries(groupedProviders).map(([provider, models]) => (
               <div key={provider}>
-                <div className="px-3 py-1.5 text-xs font-medium text-gray-400 dark:text-gray-500 bg-gray-50 dark:bg-gray-900/50">
-                  {providerLabel[provider] || provider}
+                <div className={clsx(
+                  'px-3 py-1.5 text-xs font-medium bg-gray-50 dark:bg-gray-900/50',
+                  provider === 'medical'
+                    ? 'text-emerald-600 dark:text-emerald-400'
+                    : 'text-gray-400 dark:text-gray-500'
+                )}>
+                  {allProviderLabels[provider] || provider}
                 </div>
-                {models.map((m) => (
-                  <button
-                    key={m.name}
-                    onClick={() => {
-                      dispatch({ type: 'SET_PROVIDER', payload: m.provider })
-                      dispatch({ type: 'SET_MODEL', payload: m.name })
-                      setOpen(false)
-                    }}
-                    className={clsx(
-                      'w-full flex items-start gap-2 px-3 py-2 text-left hover:bg-brand-50 dark:hover:bg-brand-900/20 transition-colors',
-                      m.name === state.selectedModel && 'bg-brand-50 dark:bg-brand-900/20'
-                    )}
-                  >
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-1">
-                        <span className="text-sm font-medium text-gray-800 dark:text-gray-100 truncate">
-                          {m.display_name}
-                        </span>
-                        {m.supports_vision && (
-                          <span className="text-xs bg-purple-100 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 rounded px-1">
-                            vision
-                          </span>
-                        )}
-                        {m.provider === 'tinyllama' && (
-                          <span className="text-xs bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-400 rounded px-1 font-medium">
-                            ⚡ local
-                          </span>
-                        )}
-                        {m.is_local && m.provider !== 'tinyllama' && (
-                          <span className="text-xs bg-green-100 dark:bg-green-900/30 text-green-600 dark:text-green-400 rounded px-1">
-                            local
-                          </span>
-                        )}
-                      </div>
-                      {m.description && (
-                        <p className="text-xs text-gray-400 dark:text-gray-500 truncate mt-0.5">
-                          {m.description}
-                        </p>
+                {models.map((m) => {
+                  const isMedical = medicalNames.has(m.name)
+                  return (
+                    <button
+                      key={m.name}
+                      onClick={() => {
+                        dispatch({ type: 'SET_PROVIDER', payload: m.provider })
+                        dispatch({ type: 'SET_MODEL', payload: m.name })
+                        setOpen(false)
+                      }}
+                      className={clsx(
+                        'w-full flex items-start gap-2 px-3 py-2 text-left transition-colors',
+                        isMedical
+                          ? 'hover:bg-emerald-50 dark:hover:bg-emerald-900/10'
+                          : 'hover:bg-brand-50 dark:hover:bg-brand-900/20',
+                        m.name === state.selectedModel && (
+                          isMedical
+                            ? 'bg-emerald-50 dark:bg-emerald-900/10'
+                            : 'bg-brand-50 dark:bg-brand-900/20'
+                        )
                       )}
-                      <div className="flex items-center gap-2 mt-0.5">
-                        <span className="text-xs text-gray-400">
-                          {(m.context_length / 1000).toFixed(0)}k ctx
-                        </span>
-                        {m.size_gb && (
-                          <span className="text-xs text-gray-400">{m.size_gb}GB</span>
+                    >
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-1 flex-wrap">
+                          <span className="text-sm font-medium text-gray-800 dark:text-gray-100 truncate">
+                            {m.display_name}
+                          </span>
+                          {isMedical && (
+                            <span className="inline-flex items-center gap-0.5 text-[10px] font-semibold
+                                            bg-emerald-100 dark:bg-emerald-900/30
+                                            text-emerald-700 dark:text-emerald-400
+                                            rounded px-1.5 py-0.5">
+                              <Stethoscope size={9} />
+                              medical
+                            </span>
+                          )}
+                          {m.supports_vision && (
+                            <span className="text-xs bg-purple-100 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 rounded px-1">
+                              vision
+                            </span>
+                          )}
+                          {m.is_local && (
+                            <span className="text-xs bg-green-100 dark:bg-green-900/30 text-green-600 dark:text-green-400 rounded px-1">
+                              local
+                            </span>
+                          )}
+                        </div>
+                        {m.description && (
+                          <p className="text-xs text-gray-400 dark:text-gray-500 truncate mt-0.5">
+                            {m.description}
+                          </p>
                         )}
+                        <div className="flex items-center gap-2 mt-0.5">
+                          <span className="text-xs text-gray-400">
+                            {(m.context_length / 1000).toFixed(0)}k ctx
+                          </span>
+                          {m.size_gb && (
+                            <span className="text-xs text-gray-400">{m.size_gb}GB</span>
+                          )}
+                        </div>
                       </div>
-                    </div>
-                    {m.name === state.selectedModel && (
-                      <div className="w-2 h-2 rounded-full bg-brand-500 mt-1.5 flex-shrink-0" />
-                    )}
-                  </button>
-                ))}
+                      {m.name === state.selectedModel && (
+                        <div className="w-2 h-2 rounded-full bg-brand-500 mt-1.5 flex-shrink-0" />
+                      )}
+                    </button>
+                  )
+                })}
               </div>
             ))}
 
