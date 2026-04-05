@@ -578,7 +578,171 @@ def _checkboxes_to_text(checkboxes: list[dict]) -> str:
     return "\n".join(lines)
 
 
-# ── Image enhancement for medical scans ──────────────────────────────────────
+# ── Stamp and seal removal ───────────────────────────────────────────────────
+
+# Ink colours common in medical stamps (CONFIDENTIAL, RECEIVED, DRAFT, COPY)
+_STAMP_HUE_RANGES = [
+    (330, 360, 60),
+    (0,   20,  60),
+    (200, 260, 50),
+    (90,  160, 45),
+    (20,  50,  55),
+]
+
+_STAMP_KEYWORDS = {
+    "confidential", "received", "draft", "copy", "void", "approved",
+    "original", "fax", "transmitted", "protected", "phi", "do not copy",
+    "not for distribution",
+}
+
+
+def _remove_stamps(img):
+    """
+    Detect and remove rubber-stamp / embossed-seal overlays from medical documents.
+
+    Strategy:
+      1. Convert to HSV and isolate coloured ink (red, blue, green).
+      2. Find connected blobs of coloured pixels.
+      3. Filter blobs by stamp-like shape (size, aspect ratio, density).
+      4. Confirm via Tesseract keyword match where possible.
+      5. Replace stamp regions with local background colour (median of border ring).
+    """
+    try:
+        from PIL import Image as PilImage, ImageDraw
+
+        w, h = img.size
+        page_area = w * h
+        rgb = img.convert("RGB")
+        r_data = list(rgb.getdata())
+
+        def rgb_to_hsv(r, g, b):
+            r, g, b = r / 255.0, g / 255.0, b / 255.0
+            mx, mn = max(r, g, b), min(r, g, b)
+            diff = mx - mn
+            if mx == 0:
+                return 0, 0, 0
+            s = diff / mx
+            if diff == 0:
+                h_val = 0.0
+            elif mx == r:
+                h_val = 60 * (((g - b) / diff) % 6)
+            elif mx == g:
+                h_val = 60 * ((b - r) / diff + 2)
+            else:
+                h_val = 60 * ((r - g) / diff + 4)
+            return h_val, s * 100, mx * 100
+
+        mask = [False] * (w * h)
+        for idx, (r, g, b) in enumerate(r_data):
+            hv, sv, vv = rgb_to_hsv(r, g, b)
+            if vv < 15 or sv < 30:
+                continue
+            for h_lo, h_hi, s_min in _STAMP_HUE_RANGES:
+                if h_lo <= hv <= h_hi and sv >= s_min:
+                    mask[idx] = True
+                    break
+
+        visited = [False] * (w * h)
+        blobs: list[list[int]] = []
+
+        def flood(start: int) -> list[int]:
+            stack = [start]
+            blob: list[int] = []
+            while stack:
+                idx = stack.pop()
+                if idx < 0 or idx >= w * h or visited[idx] or not mask[idx]:
+                    continue
+                visited[idx] = True
+                blob.append(idx)
+                x_pos, y_pos = idx % w, idx // w
+                if x_pos > 0:     stack.append(idx - 1)
+                if x_pos < w - 1: stack.append(idx + 1)
+                if y_pos > 0:     stack.append(idx - w)
+                if y_pos < h - 1: stack.append(idx + w)
+            return blob
+
+        for i in range(0, w * h, 4):
+            if mask[i] and not visited[i]:
+                blob = flood(i)
+                if len(blob) > 80:
+                    blobs.append(blob)
+
+        if not blobs:
+            return img
+
+        stamp_regions: list[tuple[int, int, int, int]] = []
+
+        for blob in blobs:
+            xs = [idx % w for idx in blob]
+            ys = [idx // w for idx in blob]
+            x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+            bw, bh = x2 - x1 + 1, y2 - y1 + 1
+            blob_area = bw * bh
+
+            if blob_area < page_area * 0.002 or blob_area > page_area * 0.25:
+                continue
+            ar = bw / bh if bh else 0
+            if not (0.3 <= ar <= 3.5):
+                continue
+            density = len(blob) / blob_area
+            if density < 0.08:
+                continue
+
+            confirmed = False
+            try:
+                import pytesseract
+                margin = 6
+                crop = rgb.crop((
+                    max(0, x1 - margin), max(0, y1 - margin),
+                    min(w, x2 + margin), min(h, y2 + margin),
+                ))
+                stamp_text = pytesseract.image_to_string(crop, config="--psm 11").lower()
+                if any(kw in stamp_text for kw in _STAMP_KEYWORDS):
+                    confirmed = True
+            except Exception:
+                pass
+
+            if confirmed or (density > 0.18 and blob_area > page_area * 0.005):
+                stamp_regions.append((x1, y1, x2, y2))
+                logger.info(
+                    f"Stamp detected ({x1},{y1})–({x2},{y2}) "
+                    f"density={density:.2f} confirmed={confirmed}"
+                )
+
+        if not stamp_regions:
+            return img
+
+        result = rgb.copy()
+        draw = ImageDraw.Draw(result)
+
+        for (x1, y1, x2, y2) in stamp_regions:
+            pad = 10
+            ring: list[tuple[int, int, int]] = []
+            for bx in range(max(0, x1 - pad), min(w, x2 + pad)):
+                for by in [max(0, y1 - pad), min(h - 1, y2 + pad)]:
+                    ring.append(r_data[by * w + bx])
+            for by in range(max(0, y1 - pad), min(h, y2 + pad)):
+                for bx in [max(0, x1 - pad), min(w - 1, x2 + pad)]:
+                    ring.append(r_data[by * w + bx])
+
+            if ring:
+                bg = (
+                    sorted(p[0] for p in ring)[len(ring) // 2],
+                    sorted(p[1] for p in ring)[len(ring) // 2],
+                    sorted(p[2] for p in ring)[len(ring) // 2],
+                )
+            else:
+                bg = (255, 255, 255)
+
+            draw.rectangle([x1, y1, x2, y2], fill=bg)
+
+        logger.info(f"Removed {len(stamp_regions)} stamp(s) from image")
+        return result
+
+    except Exception as exc:
+        logger.warning(f"Stamp removal failed (using original): {exc}")
+        return img
+
 
 # ── Image quality assessment ──────────────────────────────────────────────────
 
@@ -718,6 +882,7 @@ def _enhance_medical_image(img):
         from PIL import ImageEnhance, ImageFilter, ImageOps
 
         img = _remove_scanner_borders(img)
+        img = _remove_stamps(img)        # remove CONFIDENTIAL/RECEIVED overlays
         img = _upscale_if_needed(img)
         img = _denoise_image(img)
 
