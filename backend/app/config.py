@@ -42,6 +42,14 @@ class Settings(BaseSettings):
     LOCAL_MODEL_DIR: str = "./models/local"
     DEFAULT_LOCAL_MODEL: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
+    # Vision pipeline settings
+    # Confidence threshold below which the vision cascade is triggered
+    VISION_CASCADE_THRESHOLD: float = 0.40
+    # Which engines are enabled (comma-separated).  "all" enables everything.
+    VISION_ENGINES_ENABLED: str = "all"
+    # Maximum tokens for VLM generation
+    VLM_MAX_NEW_TOKENS: int = 1024
+
     # Redis (for task queue)
     REDIS_URL: str = "redis://localhost:6379/0"
 

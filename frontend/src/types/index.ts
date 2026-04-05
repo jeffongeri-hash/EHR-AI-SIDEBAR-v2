@@ -49,6 +49,8 @@ export interface DocumentPage {
   tables: Table[]
   raw_text: string
   confidence: number
+  vision_engine_used?: string
+  claude_vision_used?: boolean
 }
 
 export interface DocumentMetadata {
@@ -68,6 +70,8 @@ export interface ProcessedDocument {
   full_text: string
   status: DocumentStatus
   error?: string
+  claude_vision_used?: boolean
+  vision_engines_used?: string[]
 }
 
 export interface DocumentUploadResponse {
@@ -83,6 +87,8 @@ export interface DocumentSummary {
   page_count: number
   status: DocumentStatus
   created_at: string
+  claude_vision_used?: boolean
+  vision_engines_used?: string[]
 }
 
 // ── Chat Types ────────────────────────────────────────────────────────────────

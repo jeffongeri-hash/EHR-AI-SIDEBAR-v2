@@ -13,6 +13,8 @@ import {
   ChevronDown,
   ChevronUp,
   CloudUpload,
+  AlertTriangle,
+  Cpu,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { useToast } from '@/contexts/ToastContext'
@@ -28,6 +30,73 @@ const ACCEPTED: Record<string, string[]> = {
   'image/tiff': ['.tiff', '.tif'],
   'image/bmp': ['.bmp'],
   'image/webp': ['.webp'],
+}
+
+// ── Engine display helpers ────────────────────────────────────────────────────
+
+const ENGINE_LABELS: Record<string, string> = {
+  tesseract:      'Tesseract',
+  easyocr:        'EasyOCR',
+  surya:          'Surya',
+  doctr:          'DocTR',
+  nougat:         'Nougat',
+  'internvl2-8b': 'InternVL2',
+  'qwen2-vl-7b':  'Qwen2-VL',
+  'llava-1.6-7b': 'LLaVA 1.6',
+  'claude-vision':'Claude Vision',
+}
+
+function engineLabel(name: string) {
+  return ENGINE_LABELS[name] ?? name
+}
+
+// ── Claude Vision Banner ──────────────────────────────────────────────────────
+
+function ClaudeVisionBanner({ engines }: { engines?: string[] }) {
+  const [dismissed, setDismissed] = useState(false)
+  if (dismissed) return null
+  return (
+    <div className="flex items-start gap-2.5 px-3 py-2.5 rounded-xl
+                    bg-amber-500/10 border border-amber-500/30 text-amber-300">
+      <AlertTriangle size={14} className="flex-shrink-0 mt-0.5" />
+      <div className="flex-1 min-w-0">
+        <p className="text-xs font-semibold leading-tight">Claude Vision API was used</p>
+        <p className="text-xs opacity-75 mt-0.5 leading-tight">
+          Open-source engines could not process this document with sufficient
+          confidence. Claude Vision was called as a fallback.
+        </p>
+        {engines && engines.length > 0 && (
+          <p className="text-xs opacity-60 mt-1">
+            Engines tried: {engines.map(engineLabel).join(' → ')}
+          </p>
+        )}
+      </div>
+      <button
+        onClick={() => setDismissed(true)}
+        className="text-amber-400/60 hover:text-amber-300 flex-shrink-0"
+        title="Dismiss"
+      >
+        <X size={12} />
+      </button>
+    </div>
+  )
+}
+
+// ── Vision engine badge shown on doc card ─────────────────────────────────────
+
+function VisionBadge({ engine, isClause }: { engine?: string; isClause?: boolean }) {
+  if (!engine) return null
+  return (
+    <span className={clsx(
+      'inline-flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded-full',
+      isClause
+        ? 'bg-amber-500/15 text-amber-300 border border-amber-500/25'
+        : 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/20'
+    )}>
+      <Cpu size={9} />
+      {engineLabel(engine)}
+    </span>
+  )
 }
 
 function FileIcon({ type }: { type: string }) {
@@ -93,6 +162,24 @@ function DocCard({ doc, selected, onToggle, onDelete }: {
         </div>
       </div>
 
+      {/* Vision engine badge */}
+      {doc.vision_engines_used && doc.vision_engines_used.length > 0 && (
+        <div className="flex flex-wrap gap-1 mt-1.5">
+          {doc.vision_engines_used.map((eng) => (
+            <VisionBadge key={eng} engine={eng} isClause={eng === 'claude-vision'} />
+          ))}
+        </div>
+      )}
+
+      {/* Per-document Claude Vision warning */}
+      {doc.claude_vision_used && (
+        <div className="mt-1.5 flex items-center gap-1.5 px-2 py-1 rounded-lg
+                        bg-amber-500/10 border border-amber-500/25">
+          <AlertTriangle size={11} className="text-amber-400 flex-shrink-0" />
+          <span className="text-[10px] text-amber-300">Claude Vision used for this document</span>
+        </div>
+      )}
+
       {showInfo && (
         <div className="mt-2 pt-2 border-t border-gray-100 dark:border-gray-700 text-xs text-gray-500 dark:text-gray-400 space-y-0.5">
           <p>ID: <span className="font-mono">{doc.document_id.slice(0, 8)}…</span></p>
@@ -110,6 +197,12 @@ export default function DocumentUpload() {
   const [uploadProgress, setUploadProgress] = useState<Record<string, number>>({})
   const [ocrEngine, setOcrEngine] = useState<'auto' | 'easyocr' | 'tesseract'>('auto')
   const [enhanceImages, setEnhanceImages] = useState(true)
+
+  // Aggregate Claude Vision usage across all documents in current session
+  const claudeVisionDocs = state.documents.filter((d) => d.claude_vision_used)
+  const allVisionEngines = Array.from(
+    new Set(state.documents.flatMap((d) => d.vision_engines_used ?? []))
+  )
 
   const onDrop = useCallback(async (accepted: File[]) => {
     if (!accepted.length) return
@@ -288,6 +381,11 @@ export default function DocumentUpload() {
           </button>
         </div>
       </div>
+
+      {/* Session-level Claude Vision banner */}
+      {claudeVisionDocs.length > 0 && (
+        <ClaudeVisionBanner engines={allVisionEngines} />
+      )}
 
       {/* Document list */}
       <div className="flex-1 overflow-y-auto space-y-2">

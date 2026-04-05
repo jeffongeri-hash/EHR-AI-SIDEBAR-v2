@@ -21,10 +21,21 @@ def _utcnow() -> datetime:
 # ── Enums ─────────────────────────────────────────────────────────────────────
 
 class OCREngine(str, Enum):
-    AUTO = "auto"
+    # Classic engines
+    AUTO      = "auto"
     TESSERACT = "tesseract"
-    EASYOCR = "easyocr"
-    NONE = "none"
+    EASYOCR   = "easyocr"
+    NONE      = "none"
+    # Transformer OCR engines
+    SURYA     = "surya"       # SOTA open OCR
+    DOCTR     = "doctr"       # DocTR transformer OCR
+    NOUGAT    = "nougat"      # Meta Nougat (scientific/medical PDFs)
+    # Vision-Language Models
+    INTERNVL2  = "internvl2"  # InternVL2-8B
+    QWEN2VL    = "qwen2vl"    # Qwen2-VL-7B
+    LLAVA      = "llava"      # LLaVA 1.6-7B
+    # API fallback (always flagged)
+    CLAUDE_VISION = "claude_vision"
 
 
 class DocumentStatus(str, Enum):
@@ -139,6 +150,9 @@ class DocumentPage(BaseModel):
     has_handwriting: bool = False
     chart_regions: List[Dict[str, Any]] = Field(default_factory=list)  # {x1,y1,x2,y2,chart_type,title}
     has_charts: bool = False
+    # Vision engine tracking
+    vision_engine_used: str = ""         # which engine produced text for this page
+    claude_vision_used: bool = False     # True if Claude Vision API was called
 
 
 class ProcessedDocument(BaseModel):
@@ -152,6 +166,9 @@ class ProcessedDocument(BaseModel):
     document_type_signals: List[str] = Field(default_factory=list)  # why this type was chosen
     error: Optional[str] = None
     partial_page_errors: List[str] = Field(default_factory=list)
+    # Vision engine tracking across all pages
+    claude_vision_used: bool = False         # any page used Claude Vision API
+    vision_engines_used: List[str] = Field(default_factory=list)  # all engines used
 
 
 class DocumentUploadResponse(BaseModel):

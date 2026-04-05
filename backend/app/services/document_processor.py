@@ -38,6 +38,7 @@ from app.models.schemas import (
 )
 from app.services.layout_service import LayoutService
 from app.services.ocr_service import OCRService
+from app.services.vision_llm_service import vision_cascade as _vision_cascade
 
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".gif"}
 _PDF_SUFFIX = ".pdf"
@@ -46,6 +47,7 @@ _DOCX_SUFFIX = ".docx"
 _MAX_RETRIES = 3           # per-page retry attempts
 _MIN_CONFIDENCE = 0.55     # below this → retry with better settings
 _MIN_TEXT_LENGTH = 15      # fewer chars than this → treat page as empty
+_VISION_CASCADE_THRESHOLD = 0.40  # below this after all retries → run vision cascade
 
 
 # ── Common medical OCR error corrections ─────────────────────────────────────
@@ -2051,6 +2053,10 @@ class DocumentProcessor:
         # Classify document type from full extracted text
         doc_type, type_confidence, type_signals = _classify_document(full_text, pages)
 
+        # Aggregate vision engine info across all pages
+        any_claude_vision = any(p.claude_vision_used for p in pages)
+        engines_used = list({p.vision_engine_used for p in pages if p.vision_engine_used})
+
         return ProcessedDocument(
             document_id=doc_id,
             metadata=metadata,
@@ -2062,6 +2068,8 @@ class DocumentProcessor:
             document_type=doc_type,
             document_type_confidence=type_confidence,
             document_type_signals=type_signals,
+            claude_vision_used=any_claude_vision,
+            vision_engines_used=engines_used,
         )
 
     # ── PDF pipeline ──────────────────────────────────────────────────────────
@@ -2186,6 +2194,23 @@ class DocumentProcessor:
             if chart_text:
                 clean_text = clean_text + "\n\n" + chart_text
 
+            # ── Vision cascade (when OCR confidence still too low) ─────────
+            vision_engine_used = engine.value if hasattr(engine, "value") else str(engine)
+            claude_vision_used = False
+            if conf < _VISION_CASCADE_THRESHOLD:
+                logger.info(
+                    f"PDF page {page_idx + 1}: conf={conf:.2f} below vision threshold "
+                    f"({_VISION_CASCADE_THRESHOLD}), running vision cascade"
+                )
+                vr = _vision_cascade(img)
+                if vr.text.strip() and not vr.error:
+                    clean_text = vr.text
+                    vision_engine_used = vr.engine_name
+                    claude_vision_used = vr.claude_used
+                    conf = max(conf, vr.confidence)
+                elif vr.error:
+                    logger.warning(f"Vision cascade error on PDF page {page_idx + 1}: {vr.error}")
+
             return DocumentPage(
                 page_number=page_idx + 1,
                 width=float(img.width),
@@ -2204,6 +2229,8 @@ class DocumentProcessor:
                 has_handwriting=has_hw,
                 chart_regions=chart_regions,
                 has_charts=has_charts,
+                vision_engine_used=vision_engine_used,
+                claude_vision_used=claude_vision_used,
             )
 
         except MemoryError:
@@ -2625,6 +2652,23 @@ class DocumentProcessor:
             if chart_text:
                 text = text + "\n\n" + chart_text
 
+            # ── Vision cascade (when OCR confidence still too low) ─────────
+            vision_engine_used = engine.value if hasattr(engine, "value") else str(engine)
+            claude_vision_used = False
+            if conf < _VISION_CASCADE_THRESHOLD:
+                logger.info(
+                    f"Image frame {frame_idx + 1}: conf={conf:.2f} below vision threshold "
+                    f"({_VISION_CASCADE_THRESHOLD}), running vision cascade"
+                )
+                vr = _vision_cascade(img)
+                if vr.text.strip() and not vr.error:
+                    text = vr.text
+                    vision_engine_used = vr.engine_name
+                    claude_vision_used = vr.claude_used
+                    conf = max(conf, vr.confidence)
+                elif vr.error:
+                    logger.warning(f"Vision cascade error on frame {frame_idx + 1}: {vr.error}")
+
             return DocumentPage(
                 page_number=frame_idx + 1,
                 width=float(img.width),
@@ -2643,6 +2687,8 @@ class DocumentProcessor:
                 has_handwriting=has_hw,
                 chart_regions=chart_regions,
                 has_charts=has_charts,
+                vision_engine_used=vision_engine_used,
+                claude_vision_used=claude_vision_used,
             )
 
         except Exception as exc:
