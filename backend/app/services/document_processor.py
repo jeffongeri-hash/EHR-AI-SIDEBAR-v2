@@ -299,6 +299,134 @@ def _dewarp_perspective(img):
         return img
 
 
+# ── Adaptive binarization (Sauvola method) ───────────────────────────────────
+
+def _sauvola_binarize(img, window: int = 51, k: float = 0.34, r: float = 128.0):
+    """
+    Sauvola adaptive thresholding for medical documents with uneven illumination.
+
+    Unlike global thresholding (which uses one cutoff for the whole page),
+    Sauvola computes a LOCAL threshold for every pixel based on the mean and
+    standard deviation of its neighbourhood:
+
+        T(x,y) = mean(x,y) * [1 + k * (std(x,y)/r - 1)]
+
+    This handles:
+      - Carbonless copy (NCR) paper — very faint, uneven background
+      - Book-scan shadows (dark wedge near spine)
+      - Yellowed / aged medical records
+      - Uneven scanner illumination
+      - Mixed printed + handwritten regions on the same page
+
+    Parameters
+    ----------
+    window : int
+        Neighbourhood size in pixels (must be odd).  51px works well for
+        300 DPI medical scans; reduce to 31 for lower-res images.
+    k : float
+        Sensitivity.  Higher = more aggressive (keeps more as foreground).
+        Range 0.2–0.5; 0.34 is standard for medical documents.
+    r : float
+        Dynamic range of standard deviation.  128 is standard for 8-bit images.
+
+    Returns the binarized image as RGB (white background, black text).
+    Falls back to the input image on any error.
+    """
+    try:
+        import numpy as np
+        from PIL import Image as PilImage
+
+        gray = np.array(img.convert("L"), dtype=np.float64)
+        h, w = gray.shape
+        half = window // 2
+
+        # Pad with reflection so border pixels get a full neighbourhood
+        padded = np.pad(gray, half, mode="reflect")
+
+        # Integral images for O(1) mean and variance per window
+        integral     = np.cumsum(np.cumsum(padded,          axis=0), axis=1)
+        integral_sq  = np.cumsum(np.cumsum(padded ** 2,     axis=0), axis=1)
+
+        def _box_sum(ii, y1, x1, y2, x2):
+            """Sum of region [y1:y2, x1:x2] using integral image."""
+            s = ii[y2, x2]
+            if y1 > 0: s -= ii[y1 - 1, x2]
+            if x1 > 0: s -= ii[y2, x1 - 1]
+            if y1 > 0 and x1 > 0: s += ii[y1 - 1, x1 - 1]
+            return s
+
+        win_area = window * window
+        output = np.zeros((h, w), dtype=np.uint8)
+
+        # Vectorised computation over all pixels
+        # Build coordinate grids
+        ys = np.arange(h)
+        xs = np.arange(w)
+        y1s = ys                    # top of window in padded coords
+        y2s = ys + window - 1 + 1  # +1 because cumsum is inclusive
+        x1s = xs
+        x2s = xs + window - 1 + 1
+
+        # We compute row-by-row to avoid a huge (h*w*window^2) memory spike
+        for y in range(h):
+            py1 = y
+            py2 = y + window
+            row_sum    = (integral[py2, x2s] - integral[py1 - 1, x2s]
+                          - integral[py2, x1s - 1] + integral[py1 - 1, x1s - 1]
+                          if py1 > 0 else
+                          integral[py2, x2s] - integral[py2, x1s - 1])
+            row_sum_sq = (integral_sq[py2, x2s] - integral_sq[py1 - 1, x2s]
+                          - integral_sq[py2, x1s - 1] + integral_sq[py1 - 1, x1s - 1]
+                          if py1 > 0 else
+                          integral_sq[py2, x2s] - integral_sq[py2, x1s - 1])
+
+            mean = row_sum / win_area
+            # Clamp variance to avoid sqrt of negative due to float precision
+            var  = np.maximum(0.0, row_sum_sq / win_area - mean ** 2)
+            std  = np.sqrt(var)
+
+            threshold = mean * (1.0 + k * (std / r - 1.0))
+
+            row_pixels = gray[y, :]
+            output[y, :] = np.where(row_pixels <= threshold, 0, 255).astype(np.uint8)
+
+        result = PilImage.fromarray(output, mode="L").convert("RGB")
+        logger.debug(f"Sauvola binarization applied (window={window}, k={k})")
+        return result
+
+    except ImportError:
+        logger.debug("Sauvola skipped: numpy not available")
+        return img
+    except Exception as exc:
+        logger.debug(f"Sauvola binarization failed (using original): {exc}")
+        return img
+
+
+def _should_binarize(img, quality: dict | None = None) -> bool:
+    """
+    Decide whether Sauvola binarization will help this image.
+
+    Apply it when:
+      - Image quality grade is 'warn' or 'poor'
+      - Contrast score is low (< 55)   — faded / uneven illumination
+      - Noise score is high (> 15)     — fax / photocopy artifacts
+      - Brightness is very low (< 80)  — dark scan, book shadow
+
+    Skip it when:
+      - Image is already high quality (grade 'good', high contrast)
+      - Image is mostly white (blank / near-blank) — already handled upstream
+    """
+    if quality is None:
+        return False
+    grade = quality.get("grade", "good")
+    if grade == "good":
+        return False
+    contrast = quality.get("contrast_score", 100)
+    noise    = quality.get("noise_score", 0)
+    bright   = quality.get("brightness", 200)
+    return contrast < 55 or noise > 15 or bright < 80
+
+
 # ── Image enhancement for medical scans ──────────────────────────────────────
 
 def _upscale_if_needed(img, min_width: int = 1400):
@@ -1078,22 +1206,25 @@ def _assess_image_quality(img) -> dict:
         return {"grade": "unknown", "warnings": []}
 
 
-def _enhance_medical_image(img):
+def _enhance_medical_image(img, quality: dict | None = None):
     """
     Full enhancement pipeline for medical document images:
-    1. Remove scanner borders
-    2. Upscale if resolution is too low
-    3. Denoise (median filter for fax artifacts)
-    4. Grayscale + auto-level histogram
-    5. Double-sharpen for fax/photocopy quality
-    6. Contrast boost
+    1. Dewarp perspective (phone-photo trapezoid correction)
+    2. Remove scanner borders
+    3. Remove stamps / seals
+    4. Upscale if resolution is too low
+    5. Denoise (median filter for fax artifacts)
+    6. Grayscale + auto-level histogram
+    7. Double-sharpen for fax/photocopy quality
+    8. Contrast boost
+    9. Sauvola adaptive binarization (only for poor-quality / faded scans)
     """
     try:
         from PIL import ImageEnhance, ImageFilter, ImageOps
 
-        img = _dewarp_perspective(img)   # fix phone-photo trapezoid distortion
+        img = _dewarp_perspective(img)
         img = _remove_scanner_borders(img)
-        img = _remove_stamps(img)        # remove CONFIDENTIAL/RECEIVED overlays
+        img = _remove_stamps(img)
         img = _upscale_if_needed(img)
         img = _denoise_image(img)
 
@@ -1105,7 +1236,13 @@ def _enhance_medical_image(img):
         enhancer = ImageEnhance.Contrast(gray)
         gray = enhancer.enhance(1.8)
 
-        return gray.convert("RGB")
+        result = gray.convert("RGB")
+
+        # Sauvola binarization — only when quality metrics indicate it will help
+        if _should_binarize(result, quality):
+            result = _sauvola_binarize(result)
+
+        return result
     except Exception as exc:
         logger.warning(f"Image enhancement failed (using original): {exc}")
         return img
@@ -1298,7 +1435,7 @@ class DocumentProcessor:
 
             # Enhance and auto-rotate medical scans
             if enhance:
-                img = _enhance_medical_image(img)
+                img = _enhance_medical_image(img, quality)
             img, rotation = _auto_rotate(img)
 
             text, blocks, engine, conf = self.ocr_svc.process_image(
@@ -1709,7 +1846,7 @@ class DocumentProcessor:
             quality = _assess_image_quality(img)
 
             if enhance:
-                img = _enhance_medical_image(img)
+                img = _enhance_medical_image(img, quality)
             img, rotation = _auto_rotate(img)
 
             # ── Header / footer extraction (before full OCR) ──────────────
