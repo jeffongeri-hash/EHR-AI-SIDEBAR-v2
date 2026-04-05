@@ -42,6 +42,23 @@ class ModelProvider(str, Enum):
     LOCAL_HF = "local_hf"     # any HuggingFace model loaded locally
 
 
+class MedicalDocumentType(str, Enum):
+    LAB_REPORT         = "lab_report"
+    DISCHARGE_SUMMARY  = "discharge_summary"
+    PRESCRIPTION       = "prescription"
+    CLINICAL_NOTE      = "clinical_note"
+    RADIOLOGY_REPORT   = "radiology_report"
+    PATHOLOGY_REPORT   = "pathology_report"
+    CONSENT_FORM       = "consent_form"
+    REFERRAL_LETTER    = "referral_letter"
+    INSURANCE_FORM     = "insurance_form"
+    VACCINATION_RECORD = "vaccination_record"
+    OPERATIVE_REPORT   = "operative_report"
+    PROGRESS_NOTE      = "progress_note"
+    INTAKE_FORM        = "intake_form"
+    UNKNOWN            = "unknown"
+
+
 class MessageRole(str, Enum):
     USER = "user"
     ASSISTANT = "assistant"
@@ -128,6 +145,9 @@ class ProcessedDocument(BaseModel):
     pages: List[DocumentPage] = Field(default_factory=list)
     full_text: str = ""
     status: DocumentStatus = DocumentStatus.PENDING
+    document_type: MedicalDocumentType = MedicalDocumentType.UNKNOWN
+    document_type_confidence: float = 0.0   # 0.0–1.0
+    document_type_signals: List[str] = Field(default_factory=list)  # why this type was chosen
     error: Optional[str] = None
     partial_page_errors: List[str] = Field(default_factory=list)
 

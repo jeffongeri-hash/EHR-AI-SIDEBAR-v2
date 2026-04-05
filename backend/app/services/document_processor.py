@@ -1521,6 +1521,198 @@ def _auto_rotate(img):
     return img, 0
 
 
+# ── Document type classification ─────────────────────────────────────────────
+
+from app.models.schemas import MedicalDocumentType
+
+# Each entry: (DocumentType, [required_keywords], [supporting_keywords], weight)
+# A document scores points for every keyword match; highest scorer wins.
+# required_keywords: ALL must appear (or list is empty)
+# supporting_keywords: each match adds weight to the score
+_DOC_TYPE_RULES: list[tuple] = [
+    (
+        MedicalDocumentType.LAB_REPORT,
+        [],
+        ["laboratory", "lab result", "reference range", "specimen", "collected",
+         "hemoglobin", "hematocrit", "platelet", "creatinine", "glucose", "sodium",
+         "potassium", "wbc", "rbc", "urinalysis", "culture", "sensitivity",
+         "result", "units", "normal", "abnormal", "flagged", "critical value"],
+        1.0,
+    ),
+    (
+        MedicalDocumentType.DISCHARGE_SUMMARY,
+        [],
+        ["discharge summary", "discharge diagnosis", "discharge date",
+         "admission date", "admitted", "discharged", "hospital course",
+         "follow-up", "follow up", "condition at discharge", "disposition",
+         "length of stay", "principal diagnosis", "attending physician"],
+        1.2,
+    ),
+    (
+        MedicalDocumentType.PRESCRIPTION,
+        [],
+        ["rx", "prescription", "sig:", "dispense", "refill", "pharmacy",
+         "controlled substance", "dea number", "prescriber", "ndc",
+         "take by mouth", "tablets", "capsules", "milligrams", "mg",
+         "twice daily", "once daily", "as needed", "prn", "qty", "supply"],
+        1.1,
+    ),
+    (
+        MedicalDocumentType.RADIOLOGY_REPORT,
+        [],
+        ["radiology", "radiologist", "imaging", "x-ray", "mri", "ct scan",
+         "ultrasound", "findings", "impression", "technique", "contrast",
+         "no acute", "unremarkable", "within normal limits", "opacity",
+         "fracture", "lesion", "mass", "density", "scout", "field of view"],
+        1.2,
+    ),
+    (
+        MedicalDocumentType.PATHOLOGY_REPORT,
+        [],
+        ["pathology", "pathologist", "biopsy", "specimen", "microscopic",
+         "gross description", "final diagnosis", "histology", "cytology",
+         "malignant", "benign", "carcinoma", "adenocarcinoma", "differentiation",
+         "margins", "lymph node", "mitotic", "stain", "immunohistochemistry"],
+        1.3,
+    ),
+    (
+        MedicalDocumentType.CONSENT_FORM,
+        [],
+        ["consent", "i authorize", "i understand", "risks and benefits",
+         "patient signature", "witness", "guardian", "authorize",
+         "informed consent", "procedure consent", "surgical consent",
+         "anesthesia consent", "hereby consent", "acknowledge"],
+        1.1,
+    ),
+    (
+        MedicalDocumentType.REFERRAL_LETTER,
+        [],
+        ["referral", "refer", "dear dr", "dear doctor", "specialist",
+         "consultation requested", "please see", "regarding patient",
+         "reason for referral", "history of present illness",
+         "past medical history", "sincerely", "thank you for seeing"],
+        1.0,
+    ),
+    (
+        MedicalDocumentType.INSURANCE_FORM,
+        [],
+        ["insurance", "claim", "policy number", "group number", "subscriber",
+         "beneficiary", "copay", "deductible", "prior authorization",
+         "icd", "cpt code", "npi", "billing", "eob", "explanation of benefits",
+         "payer", "remittance", "allowed amount"],
+        1.0,
+    ),
+    (
+        MedicalDocumentType.VACCINATION_RECORD,
+        [],
+        ["vaccine", "vaccination", "immunization", "lot number", "dose",
+         "booster", "vfc", "administered by", "immunization record",
+         "tdap", "mmr", "varicella", "hepatitis", "influenza", "covid",
+         "expiration date", "site", "route"],
+        1.2,
+    ),
+    (
+        MedicalDocumentType.OPERATIVE_REPORT,
+        [],
+        ["operative report", "operation", "surgeon", "procedure performed",
+         "preoperative diagnosis", "postoperative diagnosis", "anesthesia",
+         "incision", "dissection", "hemostasis", "closure", "findings",
+         "complications", "estimated blood loss", "specimens sent",
+         "counts correct", "scrub nurse"],
+        1.3,
+    ),
+    (
+        MedicalDocumentType.PROGRESS_NOTE,
+        [],
+        ["progress note", "subjective", "objective", "assessment", "plan",
+         "soap", "interval history", "review of systems", "physical exam",
+         "vital signs", "impression", "chief complaint", "hpi",
+         "history of present illness", "medications", "allergies"],
+        1.0,
+    ),
+    (
+        MedicalDocumentType.INTAKE_FORM,
+        [],
+        ["intake form", "patient information", "date of birth", "emergency contact",
+         "insurance information", "medical history", "current medications",
+         "allergies", "primary care physician", "reason for visit",
+         "social history", "family history", "occupation", "marital status"],
+        0.9,
+    ),
+    (
+        MedicalDocumentType.CLINICAL_NOTE,
+        [],
+        ["clinical note", "note date", "author", "encounter", "chief complaint",
+         "assessment and plan", "problem list", "diagnosis", "treatment",
+         "patient presents", "follow-up", "reviewed", "discussed with patient"],
+        0.8,   # generic catch-all for clinical notes
+    ),
+]
+
+# Minimum score to make a classification (below = UNKNOWN)
+_MIN_CLASSIFICATION_SCORE = 2.5
+
+
+def _classify_document(full_text: str, pages: list) -> tuple:
+    """
+    Classify a medical document into one of the MedicalDocumentType categories
+    using keyword scoring across the full document text.
+
+    Returns (document_type, confidence_score, signals_list).
+
+    confidence is normalised 0.0–1.0 based on how far ahead the top scorer is.
+    signals_list contains the matched keywords that drove the decision.
+    """
+    if not full_text or len(full_text.strip()) < 30:
+        return MedicalDocumentType.UNKNOWN, 0.0, []
+
+    text_lower = full_text.lower()
+
+    scores: dict[MedicalDocumentType, float] = {}
+    matched_signals: dict[MedicalDocumentType, list[str]] = {}
+
+    for doc_type, required, supporting, weight in _DOC_TYPE_RULES:
+        # All required keywords must be present
+        if required and not all(kw in text_lower for kw in required):
+            continue
+
+        hits: list[str] = []
+        score = 0.0
+
+        for kw in supporting:
+            count = text_lower.count(kw)
+            if count > 0:
+                # Diminishing returns for repeated keywords
+                score += weight * min(count, 3)
+                hits.append(kw)
+
+        if score > 0:
+            scores[doc_type] = score
+            matched_signals[doc_type] = hits
+
+    if not scores:
+        return MedicalDocumentType.UNKNOWN, 0.0, []
+
+    best_type = max(scores, key=lambda t: scores[t])
+    best_score = scores[best_type]
+
+    if best_score < _MIN_CLASSIFICATION_SCORE:
+        return MedicalDocumentType.UNKNOWN, 0.0, []
+
+    # Normalise confidence: ratio of best score to sum of all scores
+    total = sum(scores.values())
+    confidence = round(min(1.0, best_score / total * 1.8), 3)  # scale so clear winner → ~0.9+
+
+    signals = matched_signals[best_type][:8]  # top 8 signals only
+
+    logger.info(
+        f"Document classified as {best_type.value} "
+        f"(confidence={confidence:.2f}, signals={signals[:4]})"
+    )
+
+    return best_type, confidence, signals
+
+
 # ── Main processor ────────────────────────────────────────────────────────────
 
 class DocumentProcessor:
@@ -1612,6 +1804,9 @@ class DocumentProcessor:
         logger.info(f"[{doc_id}] {status.value.upper()} — {len(pages)} pages, "
                     f"{len(full_text)} chars, {elapsed}ms")
 
+        # Classify document type from full extracted text
+        doc_type, type_confidence, type_signals = _classify_document(full_text, pages)
+
         return ProcessedDocument(
             document_id=doc_id,
             metadata=metadata,
@@ -1620,6 +1815,9 @@ class DocumentProcessor:
             status=status,
             error=top_error,
             partial_page_errors=[f"p{p.page_number}: {p.error}" for p in failed_pages],
+            document_type=doc_type,
+            document_type_confidence=type_confidence,
+            document_type_signals=type_signals,
         )
 
     # ── PDF pipeline ──────────────────────────────────────────────────────────
