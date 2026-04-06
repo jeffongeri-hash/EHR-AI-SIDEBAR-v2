@@ -15,6 +15,7 @@ aiosqlite==0.22.1
 greenlet==3.2.5
 
 # ── Auth / security ───────────────────────────────────────────────────────────
+email-validator>=2.0.0
 bcrypt==5.0.0
 passlib==1.7.4
 python-jose==3.5.0

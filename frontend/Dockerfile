@@ -1,6 +1,9 @@
 # Build stage
 FROM node:20-alpine AS builder
 WORKDIR /app
+# Accept VITE_* build args so they get baked into the static bundle
+ARG VITE_API_URL=http://localhost:8000/api
+ENV VITE_API_URL=${VITE_API_URL}
 COPY package*.json ./
 RUN npm ci
 COPY . .

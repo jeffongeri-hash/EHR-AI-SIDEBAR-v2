@@ -8,7 +8,7 @@ from loguru import logger
 
 from app.api.documents import get_document_context
 from app.core.audit import get_audit_logger
-# from app.core.rate_limit import limiter  # temporarily disabled
+from app.core.rate_limit import limiter
 from app.core.user_auth import get_current_user
 from app.models.schemas import (
     AvailableModels,
@@ -27,7 +27,7 @@ _llm = LLMService()
 
 
 @router.post("/", response_model=ChatResponse)
-# @limiter.limit("30/minute")  # temporarily disabled
+@limiter.limit("30/minute")
 async def chat(request: ChatRequest, http_request: Request):
     """
     Send a message and receive a response.
@@ -58,7 +58,7 @@ async def chat(request: ChatRequest, http_request: Request):
 
 
 @router.post("/stream")
-# @limiter.limit("20/minute")  # temporarily disabled
+@limiter.limit("20/minute")
 async def stream_chat(request: Request, body: ChatRequest):
     """
     Server-Sent Events streaming chat endpoint.

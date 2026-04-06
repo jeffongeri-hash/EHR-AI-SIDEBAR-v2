@@ -385,27 +385,6 @@ async def upload_training_dataset(
     }
 
 
-@router.get("/datasets")
-async def list_uploaded_datasets() -> Dict[str, Any]:
-    """List all uploaded training datasets."""
-    dataset_dir = Path("./models/datasets")
-    if not dataset_dir.exists():
-        return {"success": True, "datasets": []}
-
-    datasets = []
-    for fp in dataset_dir.glob("*.json"):
-        try:
-            data = json.loads(fp.read_text())
-            datasets.append({
-                "filename": fp.name,
-                "size_mb": round(fp.stat().st_size / 1024 / 1024, 2),
-                "examples_count": len(data) if isinstance(data, list) else 1,
-                "created_at": datetime.fromtimestamp(fp.stat().st_ctime, tz=timezone.utc).isoformat(),
-            })
-        except Exception:
-            pass
-
-    return {"success": True, "datasets": sorted(datasets, key=lambda x: x["created_at"], reverse=True)}
 
 
 @router.get("/models")
@@ -445,3 +424,358 @@ async def generate_sample_medical_data() -> Dict[str, Any]:
          "output": "HR 60-100 bpm, BP <120/80 mmHg, RR 12-20/min, Temp 36-37.2°C, SpO2 >95%."},
     ]
     return {"success": True, "data": sample, "count": len(sample)}
+
+
+# ── Frontend-compatible REST API (/jobs, /templates, /upload-document, etc.) ───
+
+# Extra in-memory stores to track full job metadata for the new job API
+_job_configs: Dict[str, Dict] = {}       # job_id → TrainingConfig dict
+_job_logs: Dict[str, List[str]] = {}      # job_id → log lines
+_job_progress: Dict[str, float] = {}      # job_id → 0.0–1.0
+_job_epoch: Dict[str, int] = {}           # job_id → current epoch
+_job_loss: Dict[str, Optional[float]] = {}  # job_id → latest loss
+
+
+def _job_to_frontend(job_id: str) -> Dict[str, Any]:
+    """Convert internal job dict to the shape expected by the frontend FineTuneJob type."""
+    job = _jobs.get(job_id, {})
+    return {
+        "job_id": job_id,
+        "config": _job_configs.get(job_id, {}),
+        "status": job.get("status", "queued"),
+        "progress": _job_progress.get(job_id, 0.0),
+        "current_epoch": _job_epoch.get(job_id, 0),
+        "current_loss": _job_loss.get(job_id),
+        "created_at": job.get("started_at", datetime.now(timezone.utc).isoformat()),
+        "started_at": job.get("started_at"),
+        "completed_at": job.get("completed_at"),
+        "error": job.get("error"),
+        "output_path": None,
+        "logs": _job_logs.get(job_id, []),
+    }
+
+
+class TrainingConfigRequest(BaseModel):
+    """Matches the frontend TrainingConfig type."""
+    base_model: str = "meta-llama/Llama-3.2-3B-Instruct"
+    output_model_name: str = "ehr-model"
+    dataset_path: Optional[str] = None
+    training_examples: Optional[List[Dict[str, str]]] = None
+    num_epochs: int = 3
+    batch_size: int = 4
+    learning_rate: float = 2e-4
+    warmup_steps: int = 100
+    max_seq_length: int = 2048
+    gradient_accumulation_steps: int = 4
+    use_lora: bool = True
+    lora_config: Optional[Dict[str, Any]] = None
+    load_in_4bit: bool = True
+    fp16: bool = True
+    gradient_checkpointing: bool = True
+    push_to_hub: bool = False
+    hf_repo_id: Optional[str] = None
+
+
+@router.post("/jobs")
+async def create_job(config: TrainingConfigRequest) -> Dict[str, Any]:
+    """Start a fine-tune job (frontend-compatible endpoint)."""
+    training_data = config.training_examples or []
+    if not training_data and not config.dataset_path:
+        raise HTTPException(status_code=400, detail="Provide training_examples or dataset_path")
+
+    # Convert to FineTuneRequest format
+    ft_request = FineTuneRequest(
+        training_data=training_data if training_data else [
+            {"instruction": "placeholder", "output": "placeholder"}
+        ],
+        base_model=config.base_model,
+        learning_rate=config.learning_rate,
+        num_epochs=config.num_epochs,
+        batch_size=config.batch_size,
+        max_seq_length=config.max_seq_length,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        lora_r=config.lora_config.get("r", 8) if config.lora_config else 8,
+        lora_alpha=config.lora_config.get("lora_alpha", 16) if config.lora_config else 16,
+        load_in_4bit=config.load_in_4bit,
+    )
+
+    job_id = str(uuid.uuid4())
+    _progress_queues[job_id] = asyncio.Queue()
+    _jobs[job_id] = {
+        "job_id": job_id,
+        "status": FineTuneStatus.PENDING,
+        "base_model": config.base_model,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": None,
+        "error": None,
+    }
+    _job_configs[job_id] = config.model_dump()
+    _job_logs[job_id] = []
+    _job_progress[job_id] = 0.0
+    _job_epoch[job_id] = 0
+    _job_loss[job_id] = None
+
+    asyncio.create_task(_run_fine_tune_job(job_id, ft_request))
+
+    return {
+        "job_id": job_id,
+        "status": FineTuneStatus.PENDING,
+        "message": f"Job queued. Stream progress at GET /api/finetune/progress/{job_id}",
+    }
+
+
+@router.get("/jobs")
+async def list_jobs() -> List[Dict[str, Any]]:
+    """List all fine-tune jobs (frontend-compatible)."""
+    return [_job_to_frontend(jid) for jid in _jobs]
+
+
+@router.get("/jobs/{job_id}")
+async def get_job(job_id: str) -> Dict[str, Any]:
+    """Get a single fine-tune job (frontend-compatible)."""
+    if job_id not in _jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _job_to_frontend(job_id)
+
+
+@router.delete("/jobs/{job_id}")
+async def cancel_job(job_id: str) -> Dict[str, Any]:
+    """Cancel / remove a fine-tune job."""
+    if job_id not in _jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    _jobs[job_id]["status"] = FineTuneStatus.FAILED
+    _jobs[job_id]["error"] = "Cancelled by user"
+    # Drain the progress queue so the background task exits
+    q = _progress_queues.get(job_id)
+    if q:
+        await q.put({"type": "error", "message": "Cancelled"})
+    return {"success": True, "message": f"Job {job_id} cancelled"}
+
+
+@router.get("/templates/ehr")
+async def get_ehr_template() -> Dict[str, Any]:
+    """Return a starter EHR fine-tuning template with sample examples."""
+    examples = [
+        {
+            "instruction": "Summarise the following clinical note in plain language for the patient.",
+            "input": "",
+            "output": "",
+            "system": "You are a medical documentation assistant. Always be accurate, concise, and avoid jargon.",
+        },
+        {
+            "instruction": "Extract all medications mentioned in the following text.",
+            "input": "",
+            "output": "",
+            "system": "",
+        },
+        {
+            "instruction": "Identify abnormal lab values and explain their clinical significance.",
+            "input": "",
+            "output": "",
+            "system": "",
+        },
+        {
+            "instruction": "List the patient's active problems from the following clinical note.",
+            "input": "",
+            "output": "",
+            "system": "",
+        },
+        {
+            "instruction": "Translate the following ICD-10 codes into plain English diagnoses.",
+            "input": "",
+            "output": "",
+            "system": "",
+        },
+    ]
+    return {
+        "success": True,
+        "template_name": "EHR Medical Assistant",
+        "base_model": "meta-llama/Llama-3.2-3B-Instruct",
+        "examples": examples,
+        "system_prompt": (
+            "You are an intelligent EHR assistant specialising in clinical documentation, "
+            "medical terminology, lab result interpretation, and patient communication. "
+            "Always be accurate. Flag ambiguities. Do NOT provide diagnoses or treatment advice."
+        ),
+    }
+
+
+@router.post("/upload-document")
+async def upload_training_document(
+    file: UploadFile = File(...),
+    chunk_size: int = Form(512),
+    overlap: int = Form(64),
+    format: str = Form("text"),
+) -> Dict[str, Any]:
+    """
+    Upload a medical document (PDF/DOCX/image), run OCR, and chunk it into
+    training data for fine-tuning.
+    """
+    import re
+    from pathlib import Path as _Path
+    import tempfile
+
+    suffix = _Path(file.filename or "upload").suffix.lower()
+    if suffix not in {".pdf", ".docx", ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}:
+        raise HTTPException(status_code=415, detail=f"Unsupported file type '{suffix}'")
+
+    content = await file.read()
+    if len(content) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (max 50 MB)")
+
+    # Write to a temp file and run the document processor
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = _Path(tmp.name)
+
+    try:
+        from app.services.document_processor import DocumentProcessor
+        processor = DocumentProcessor()
+        doc = processor.process(
+            file_path=tmp_path,
+            document_id=str(uuid.uuid4()),
+        )
+        full_text = doc.full_text or ""
+        page_count = doc.metadata.page_count
+    except Exception as exc:
+        logger.error("Document processing failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"OCR failed: {exc}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    # Chunk the extracted text
+    words = full_text.split()
+    chunks: List[str] = []
+    step = max(1, chunk_size - overlap)
+    for i in range(0, len(words), step):
+        chunk = " ".join(words[i: i + chunk_size])
+        if chunk.strip():
+            chunks.append(chunk)
+
+    if format == "instruction":
+        training_data = [
+            {
+                "instruction": "Summarise or answer questions about the following medical text.",
+                "input": chunk,
+                "output": "",
+            }
+            for chunk in chunks
+        ]
+    else:
+        training_data = [{"text": chunk} for chunk in chunks]
+
+    # Persist as a dataset
+    dataset_dir = _Path("./models/datasets")
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    dataset_id = str(uuid.uuid4())
+    safe_name = re.sub(r"[^\w\-.]", "_", file.filename or "upload")
+    dataset_filename = f"{dataset_id}_{safe_name}.json"
+    dataset_path = dataset_dir / dataset_filename
+    dataset_path.write_text(json.dumps(training_data, indent=2))
+
+    size_kb = round(dataset_path.stat().st_size / 1024, 1)
+
+    return {
+        "dataset_id": dataset_id,
+        "dataset_path": str(dataset_path),
+        "filename": file.filename or "upload",
+        "chunk_count": len(chunks),
+        "page_count": page_count,
+        "format": format,
+        "preview": chunks[0][:200] if chunks else "",
+    }
+
+
+@router.get("/datasets")
+async def list_datasets_v2() -> List[Dict[str, Any]]:
+    """List uploaded training datasets (frontend-compatible format)."""
+    dataset_dir = Path("./models/datasets")
+    if not dataset_dir.exists():
+        return []
+
+    result = []
+    for fp in sorted(dataset_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            data = json.loads(fp.read_text())
+            count = len(data) if isinstance(data, list) else 1
+            # Parse dataset_id from filename prefix (uuid_originalname.json)
+            parts = fp.stem.split("_", 1)
+            dataset_id = parts[0] if len(parts[0]) == 36 else fp.stem
+            original_name = parts[1].replace("_", " ") if len(parts) > 1 else fp.name
+            result.append({
+                "dataset_id": dataset_id,
+                "filename": original_name,
+                "dataset_path": str(fp),
+                "chunk_count": count,
+                "size_kb": round(fp.stat().st_size / 1024, 1),
+            })
+        except Exception:
+            pass
+    return result
+
+
+@router.delete("/datasets/{dataset_id}")
+async def delete_dataset(dataset_id: str) -> Dict[str, Any]:
+    """Delete a training dataset by its ID prefix."""
+    dataset_dir = Path("./models/datasets")
+    matches = list(dataset_dir.glob(f"{dataset_id}_*.json")) + list(dataset_dir.glob(f"{dataset_id}.json"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    for fp in matches:
+        fp.unlink()
+    return {"success": True, "message": f"Dataset {dataset_id} deleted"}
+
+
+class ModelCompareRequest(BaseModel):
+    prompt: str
+    base_model: str
+    fine_tuned_model: str
+    max_tokens: int = 512
+    temperature: float = 0.7
+    system_prompt: Optional[str] = None
+
+
+@router.post("/compare")
+async def compare_models(req: ModelCompareRequest) -> Dict[str, Any]:
+    """Run the same prompt through two models and return side-by-side results."""
+    import time
+    from app.services.llm_service import LLMService
+    from app.models.schemas import ChatRequest as BackendChatRequest
+
+    llm = LLMService()
+    results = {}
+
+    for label, model_id in [("base", req.base_model), ("fine_tuned", req.fine_tuned_model)]:
+        t0 = time.monotonic()
+        try:
+            chat_req = BackendChatRequest(
+                message=req.prompt,
+                model_name=model_id,
+                system_prompt=req.system_prompt or "",
+                temperature=req.temperature,
+                max_tokens=req.max_tokens,
+            )
+            resp = await llm.chat(chat_req)
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            results[label] = {
+                "model_name": model_id,
+                "response": resp.message.content,
+                "latency_ms": elapsed_ms,
+                "tokens_generated": resp.usage.get("output_tokens") if resp.usage else None,
+                "error": None,
+            }
+        except Exception as exc:
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            results[label] = {
+                "model_name": model_id,
+                "response": "",
+                "latency_ms": elapsed_ms,
+                "tokens_generated": None,
+                "error": str(exc),
+            }
+
+    return {
+        "prompt": req.prompt,
+        "base": results.get("base", {}),
+        "fine_tuned": results.get("fine_tuned", {}),
+    }

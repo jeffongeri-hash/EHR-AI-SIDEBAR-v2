@@ -1,7 +1,8 @@
-# Environment — .env is intentionally committed so keys transfer to new machine
-# .env
+# Environment — NEVER commit .env (contains live API keys)
+# Use .env.example as the template, fill in values locally
+.env
 .env.local
-# *.env
+*.env
 
 # Python
 __pycache__/

@@ -16,7 +16,7 @@ import type {
 import { clearAuth, getToken } from '@/services/auth'
 
 // Original EHR AI Sidebar backend with full document upload and chat functionality
-const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8002/api'
+const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api'
 
 const http: AxiosInstance = axios.create({
   baseURL: BASE_URL,

@@ -12,18 +12,17 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from loguru import logger
-# from slowapi import _rate_limit_exceeded_handler
-# from slowapi.errors import RateLimitExceeded
-# from slowapi.middleware import SlowAPIMiddleware
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
-from app.api import chat  # re-enabled for chat functionality
+from app.api import chat
 from app.api import documents
 from app.api.audit_log import router as audit_router
+from app.api.auth import router as auth_router
 from app.api.routes.finetune import router as finetune_router
-from app.api.routes.travel import router as travel_router
-# from app.api.auth import router as auth_router  # temporarily disabled due to email-validator
 from app.config import settings
-# from app.core.rate_limit import limiter
+from app.core.rate_limit import limiter
 from app.db.base import init_db
 from app.middleware.security_headers import SecurityHeadersMiddleware
 
@@ -119,12 +118,12 @@ app = FastAPI(
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
 
-# app.state.limiter = limiter
-# app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ── Middleware (order matters: outermost runs last on response) ───────────────
 
-# app.add_middleware(SlowAPIMiddleware)                # Rate limiting enforcement
+app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)        # HIPAA security headers
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
@@ -137,13 +136,11 @@ app.add_middleware(
 
 # ── API Routers ───────────────────────────────────────────────────────────────
 
-# app.include_router(auth_router, prefix="/api")  # temporarily disabled due to email-validator
-app.include_router(chat.router, prefix="/api")  # re-enabled for chat functionality
-app.include_router(documents.router, prefix="/api")  # re-enabled for uploads
-app.include_router(finetune_router)  # TinyLlama fine-tuning endpoints
-app.include_router(travel_router)  # Travel and flight search endpoints
-# app.include_router(fine_tuning.router, prefix="/api")  # temporarily disabled
-app.include_router(audit_router, prefix="/api")
+app.include_router(auth_router,     prefix="/api")
+app.include_router(chat.router,     prefix="/api")
+app.include_router(documents.router,prefix="/api")
+app.include_router(finetune_router)               # prefix="/api/finetune" set in router
+app.include_router(audit_router,    prefix="/api")
 
 
 # ── Health & info ─────────────────────────────────────────────────────────────

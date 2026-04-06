@@ -34,6 +34,10 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        # Baked into the Vite bundle at build time — points at the backend
+        # container name so nginx can proxy inside the Docker network
+        VITE_API_URL: http://backend:8000/api
     container_name: ehr-ai-frontend
     ports:
       - "3000:80"
