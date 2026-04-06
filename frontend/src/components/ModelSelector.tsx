@@ -7,9 +7,9 @@ import type { ModelInfo } from '@/types'
 
 // Models known to be medical-specialised
 const MEDICAL_MODEL_KEYS = new Set([
-  'biomistral-7b', 'meditron-7b', 'clinicalcamel-13b', 'clinicalcamel-70b',
+  'biomistral-7b', 'meditron-7b', 'pmc-llama-13b', 'clinicalcamel-70b',
   'BioMistral/BioMistral-7B', 'epfl-llm/meditron-7b',
-  'wanglab/ClinicalCamel-13B', 'wanglab/ClinicalCamel-70B',
+  'axiong/PMC_LLaMA_13B', 'wanglab/ClinicalCamel-70B',
 ])
 
 export default function ModelSelector() {

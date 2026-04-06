@@ -1,0 +1,50 @@
+# Fine-tuning config: BioMistral-7B on EHR domain data
+# Model: BioMistral/BioMistral-7B (Apache 2.0 — open access, no HF token needed)
+# GPU requirement: ~6 GB VRAM (RTX 3060 or better)
+# Run: python fine_tuning/train.py --config fine_tuning/configs/biomistral_ehr.yaml
+
+base_model: "BioMistral/BioMistral-7B"
+output_name: "ehr-biomistral-7b-v1"
+output_dir: "./models"
+
+# Dataset: medical Q&A for EHR context
+# Swap for your own JSONL: dataset: "datasets/ehr_train.jsonl"
+dataset: "medalpaca/medical_meadow_medqa"
+dataset_split: "train"
+text_field: "text"
+
+# Training hyperparameters
+num_epochs: 3
+batch_size: 4
+gradient_accumulation_steps: 4
+learning_rate: 0.0001          # lower LR — model already medical-trained
+warmup_steps: 50
+max_seq_length: 2048
+logging_steps: 10
+save_strategy: "epoch"
+
+# LoRA (PEFT) — keeps VRAM low, preserves biomedical pre-training
+use_lora: true
+lora:
+  r: 8                         # smaller rank — model is already specialised
+  lora_alpha: 16
+  lora_dropout: 0.05
+  target_modules:
+    - q_proj
+    - v_proj
+    - k_proj
+    - o_proj
+  bias: none
+
+# Quantization
+load_in_4bit: true
+bnb_compute_dtype: "float16"
+
+# Hardware
+fp16: true
+gradient_checkpointing: true
+dataloader_num_workers: 0
+
+push_to_hub: false
+# hf_repo_id: "jomedisync/ehr-biomistral-7b"
+# hf_token: ""  # or set HF_TOKEN env var

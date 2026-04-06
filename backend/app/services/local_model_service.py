@@ -11,9 +11,9 @@ Supported out-of-the-box:
 
 Medical-specialised models:
   • BioMistral/BioMistral-7B                     (~5 GB 4-bit) — Mistral fine-tuned on PubMed Central
-  • epfl-llm/meditron-7b                         (~5 GB 4-bit) — EPFL, clinical guidelines + PubMed
-  • wanglab/ClinicalCamel-13B                    (~9 GB 4-bit) — Llama-2-13B, clinical notes
-  • wanglab/ClinicalCamel-70B                    (~40 GB 4-bit)— Llama-2-70B, strongest clinical model
+  • epfl-llm/meditron-7b                         (~5 GB 4-bit) — EPFL, clinical guidelines + PubMed  [GATED]
+  • axiong/PMC_LLaMA_13B                         (~9 GB 4-bit) — LLaMA-13B trained on PubMed Central
+  • wanglab/ClinicalCamel-70B                    (~40 GB 4-bit)— LLaMA-2-70B, strongest clinical model [GATED]
   • Any other HuggingFace causal-LM model
 
 Features:
@@ -135,6 +135,7 @@ MODEL_CATALOGUE: Dict[str, Dict[str, Any]] = {
         "description": "Mistral fine-tuned on PubMed Central — strong biomedical terminology",
         "fine_tunable": True,
         "medical": True,
+        "gated": False,
     },
     "meditron-7b": {
         "hf_id": "epfl-llm/meditron-7b",
@@ -142,19 +143,21 @@ MODEL_CATALOGUE: Dict[str, Dict[str, Any]] = {
         "size_gb": 4.5,
         "min_ram_gb": 6,
         "context_length": 4096,
-        "description": "EPFL — trained on PubMed, clinical guidelines; best for EHR Q&A",
+        "description": "EPFL — trained on PubMed + clinical guidelines; best for EHR Q&A [requires HF access]",
         "fine_tunable": True,
         "medical": True,
+        "gated": True,
     },
-    "clinicalcamel-13b": {
-        "hf_id": "wanglab/ClinicalCamel-13B",
-        "display_name": "ClinicalCamel 13B",
+    "pmc-llama-13b": {
+        "hf_id": "axiong/PMC_LLaMA_13B",
+        "display_name": "PMC-LLaMA 13B",
         "size_gb": 9.0,
         "min_ram_gb": 12,
         "context_length": 4096,
-        "description": "Llama-2-13B fine-tuned on clinical notes — faster than 70B",
+        "description": "LLaMA-13B trained on PubMed Central — strong clinical reasoning, open access",
         "fine_tunable": True,
         "medical": True,
+        "gated": False,
     },
     "clinicalcamel-70b": {
         "hf_id": "wanglab/ClinicalCamel-70B",
@@ -162,9 +165,10 @@ MODEL_CATALOGUE: Dict[str, Dict[str, Any]] = {
         "size_gb": 40.0,
         "min_ram_gb": 48,
         "context_length": 4096,
-        "description": "Llama-2-70B fine-tuned on clinical notes — highest clinical accuracy",
+        "description": "LLaMA-2-70B fine-tuned on clinical notes — highest clinical accuracy [requires HF access]",
         "fine_tunable": False,
         "medical": True,
+        "gated": True,
     },
 }
 
@@ -263,10 +267,27 @@ class LocalModelService:
             logger.info(f"Loading model '{model_id}' …")
             cache = self.config.cache_dir
 
+            # Check if model is gated and warn if HF_TOKEN is missing
+            entry = next(
+                (v for v in MODEL_CATALOGUE.values() if v["hf_id"] == model_id or
+                 model_id in (v.get("alias", ""),)),
+                MODEL_CATALOGUE.get(model_id, {})
+            )
+            hf_token = settings.HF_TOKEN or None
+            if entry.get("gated") and not hf_token:
+                logger.warning(
+                    f"Model '{model_id}' is gated on HuggingFace. "
+                    "Set HF_TOKEN in your .env file and request access at "
+                    f"https://huggingface.co/{model_id}"
+                )
+
+            token_kwargs = {"token": hf_token} if hf_token else {}
+
             self._tokenizer = AutoTokenizer.from_pretrained(
                 model_id,
                 cache_dir=cache,
                 trust_remote_code=self.config.trust_remote_code,
+                **token_kwargs,
             )
             if self._tokenizer.pad_token is None:
                 self._tokenizer.pad_token = self._tokenizer.eos_token
@@ -290,6 +311,7 @@ class LocalModelService:
             else:
                 load_kwargs["torch_dtype"] = torch.float16
 
+            load_kwargs.update(token_kwargs)
             self._model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
             self._model.config.use_cache = False
             self._active_model_id = model_id

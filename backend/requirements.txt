@@ -1,63 +1,128 @@
-accelerate>=1.3.0
-aiofiles==24.1.0
-aiosqlite==0.22.1
-annotated-types==0.7.0
-anthropic==0.45.0
-anyio==4.12.1
-async-timeout==5.0.1
-bcrypt==5.0.0
-bitsandbytes>=0.45.0
-certifi==2026.2.25
-cffi==2.0.0
-charset-normalizer==3.4.6
-click==8.1.8
-cryptography==46.0.6
-datasets>=3.0.0
-Deprecated==1.3.1
-distro==1.9.0
-ecdsa==0.19.2
-eval_type_backport==0.3.1
-exceptiongroup==1.3.1
+# ── Core web framework ────────────────────────────────────────────────────────
 fastapi==0.115.6
-greenlet==3.2.5
-h11==0.16.0
-httpcore==1.0.9
+uvicorn[standard]==0.34.0
+uvloop==0.22.1
 httptools==0.7.1
-httpx==0.28.1
-idna==3.11
-jiter==0.13.0
-limits==4.2
-loguru==0.7.3
-packaging==24.2
+websockets==15.0.1
+watchfiles==1.1.1
+python-multipart==0.0.20
+aiofiles==24.1.0
+starlette==0.41.3
+
+# ── Database ──────────────────────────────────────────────────────────────────
+SQLAlchemy==2.0.48
+aiosqlite==0.22.1
+greenlet==3.2.5
+
+# ── Auth / security ───────────────────────────────────────────────────────────
+bcrypt==5.0.0
 passlib==1.7.4
-pdfminer.six==20251107
-pdfplumber==0.11.8
-peft>=0.13.0
-pillow==11.3.0
+python-jose==3.5.0
+cryptography==46.0.6
+ecdsa==0.19.2
+rsa==4.9.1
 pyasn1==0.6.3
 pycparser==2.23
+cffi==2.0.0
+
+# ── Pydantic / settings ───────────────────────────────────────────────────────
 pydantic==2.10.5
 pydantic-settings==2.7.0
 pydantic_core==2.27.2
-PyMuPDF==1.26.5
-pypdfium2==5.6.0
+annotated-types==0.7.0
 python-dotenv==1.0.1
-python-jose==3.5.0
-python-multipart==0.0.20
-PyYAML==6.0.3
-redis==7.0.1
-rsa==4.9.1
-six==1.17.0
-slowapi==0.1.9
+
+# ── HTTP clients ──────────────────────────────────────────────────────────────
+httpx==0.28.1
+httpcore==1.0.9
+anyio==4.12.1
 sniffio==1.3.1
-SQLAlchemy==2.0.48
-starlette==0.41.3
+h11==0.16.0
+certifi==2026.2.25
+idna==3.11
+charset-normalizer==3.4.6
+
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+slowapi==0.1.9
+limits==4.2
+
+# ── Task queue ────────────────────────────────────────────────────────────────
+celery[redis]>=5.3.0
+redis==7.0.1
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+loguru==0.7.3
+
+# ── Retry ─────────────────────────────────────────────────────────────────────
 tenacity==9.1.2
+
+# ── Anthropic Claude ─────────────────────────────────────────────────────────
+anthropic>=0.45.0
+jiter==0.13.0
+
+# ── PDF processing ────────────────────────────────────────────────────────────
+PyMuPDF==1.26.5
+pdfminer.six==20251107
+pdfplumber==0.11.8
+pypdfium2==5.6.0
+
+# ── Document processing (DOCX, images) ───────────────────────────────────────
+python-docx>=1.1.0
+pillow==11.3.0
+
+# ── Numerical / array ─────────────────────────────────────────────────────────
+numpy>=1.24.0
+
+# ── OCR — classic engines ─────────────────────────────────────────────────────
+pytesseract>=0.3.10
+easyocr>=1.7.0
+
+# ── OCR — transformer engines ─────────────────────────────────────────────────
+# Surya: SOTA open OCR (installs torch as dependency)
+surya-ocr>=0.6.0
+
+# DocTR: transformer OCR, strong on forms/tables
+python-doctr[torch]>=0.8.0
+
+# Nougat: Meta model for scientific/medical PDFs
+nougat-ocr>=0.1.17
+
+# ── PyTorch ───────────────────────────────────────────────────────────────────
+# CPU-only by default. For CUDA, install separately:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch>=2.1.0
+torchvision>=0.16.0
+
+# ── HuggingFace ecosystem ────────────────────────────────────────────────────
 transformers>=4.47.0
+huggingface_hub>=0.20.0
+datasets>=3.0.0
+tokenizers>=0.15.0
+safetensors>=0.4.0
+sentencepiece>=0.1.99
+
+# ── LLM fine-tuning ───────────────────────────────────────────────────────────
+accelerate>=1.3.0
+peft>=0.13.0
 trl>=0.12.0
-typing_extensions==4.15.0
-uvicorn==0.34.0
-uvloop==0.22.1
-watchfiles==1.1.1
-websockets==15.0.1
+bitsandbytes>=0.45.0
+
+# ── VLM helpers ───────────────────────────────────────────────────────────────
+# Qwen2-VL utility functions
+qwen-vl-utils>=0.0.8
+# InternVL2 vision encoder
+timm>=0.9.0
+einops>=0.7.0
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+packaging==24.2
+click==8.1.8
+PyYAML==6.0.3
+six==1.17.0
+distro==1.9.0
+Deprecated==1.3.1
 wrapt==2.1.2
+typing_extensions==4.15.0
+exceptiongroup==1.3.1
+eval_type_backport==0.3.1
+async-timeout==5.0.1

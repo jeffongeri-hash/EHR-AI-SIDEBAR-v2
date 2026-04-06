@@ -1,0 +1,54 @@
+# Fine-tuning config: Meditron-7B on EHR domain data
+# Model: epfl-llm/meditron-7b  (Llama-2 license — GATED)
+#
+# BEFORE RUNNING:
+#   1. Request access at: https://huggingface.co/epfl-llm/meditron-7b
+#   2. Set HF_TOKEN in your .env file
+#
+# GPU requirement: ~6 GB VRAM (RTX 3060 or better)
+# Run: python fine_tuning/train.py --config fine_tuning/configs/meditron_ehr.yaml
+
+base_model: "epfl-llm/meditron-7b"
+output_name: "ehr-meditron-7b-v1"
+output_dir: "./models"
+
+# Dataset: clinical guidelines + general medical Q&A
+dataset: "medalpaca/medical_meadow_medqa"
+dataset_split: "train"
+text_field: "text"
+
+# Training hyperparameters
+num_epochs: 3
+batch_size: 4
+gradient_accumulation_steps: 4
+learning_rate: 0.0001          # conservative — already clinical-trained
+warmup_steps: 50
+max_seq_length: 2048
+logging_steps: 10
+save_strategy: "epoch"
+
+# LoRA (PEFT)
+use_lora: true
+lora:
+  r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  target_modules:
+    - q_proj
+    - v_proj
+    - k_proj
+    - o_proj
+  bias: none
+
+# Quantization
+load_in_4bit: true
+bnb_compute_dtype: "float16"
+
+# Hardware
+fp16: true
+gradient_checkpointing: true
+dataloader_num_workers: 0
+
+push_to_hub: false
+# hf_repo_id: "jomedisync/ehr-meditron-7b"
+# hf_token: ""  # or set HF_TOKEN env var

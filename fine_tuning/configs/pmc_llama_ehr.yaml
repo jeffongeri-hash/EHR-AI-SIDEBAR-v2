@@ -1,0 +1,49 @@
+# Fine-tuning config: PMC-LLaMA-13B on EHR domain data
+# Model: axiong/PMC_LLaMA_13B  (OpenRAIL — open access, no HF token needed)
+# GPU requirement: ~12 GB VRAM (RTX 3080 / A10 or better)
+# Run: python fine_tuning/train.py --config fine_tuning/configs/pmc_llama_ehr.yaml
+
+base_model: "axiong/PMC_LLaMA_13B"
+output_name: "ehr-pmc-llama-13b-v1"
+output_dir: "./models"
+
+# Dataset
+dataset: "medalpaca/medical_meadow_medqa"
+dataset_split: "train"
+text_field: "text"
+
+# Training
+num_epochs: 3
+batch_size: 2
+gradient_accumulation_steps: 8
+learning_rate: 0.0001
+warmup_steps: 100
+max_seq_length: 2048
+logging_steps: 10
+save_strategy: "epoch"
+
+# LoRA (PEFT)
+use_lora: true
+lora:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules:
+    - q_proj
+    - v_proj
+    - k_proj
+    - o_proj
+  bias: none
+
+# Quantization
+load_in_4bit: true
+bnb_compute_dtype: "float16"
+
+# Hardware
+fp16: true
+gradient_checkpointing: true
+dataloader_num_workers: 0
+
+push_to_hub: false
+# hf_repo_id: "jomedisync/ehr-pmc-llama-13b"
+# hf_token: ""
