@@ -8,7 +8,7 @@ from loguru import logger
 
 from app.api.documents import get_document_context
 from app.core.audit import get_audit_logger
-from app.core.rate_limit import limiter
+from app.core.rate_limit import check_claude_chat_limit, check_claude_stream_limit
 from app.core.user_auth import get_current_user
 from app.models.schemas import (
     AvailableModels,
@@ -27,13 +27,18 @@ _llm = LLMService()
 
 
 @router.post("/", response_model=ChatResponse)
-@limiter.limit("30/minute")
 async def chat(request: ChatRequest, http_request: Request):
     """
     Send a message and receive a response.
 
+    Rate-limited only when using Claude/Anthropic models (30 req/min).
+    Local models (Ollama, HuggingFace, medical) are unrestricted.
+
     Attach document IDs via `document_ids` to include their extracted text as context.
     """
+    # Rate-limit only Anthropic/Claude calls — local models run on user hardware
+    check_claude_chat_limit(http_request, request.model_provider)
+
     # Gather document context
     doc_context = ""
     if request.document_ids:
@@ -58,12 +63,16 @@ async def chat(request: ChatRequest, http_request: Request):
 
 
 @router.post("/stream")
-@limiter.limit("20/minute")
 async def stream_chat(request: Request, body: ChatRequest):
     """
     Server-Sent Events streaming chat endpoint.
-    Set `stream: true` in the request body.
+
+    Rate-limited only when using Claude/Anthropic models (20 req/min).
+    Local models are unrestricted.
     """
+    # Rate-limit only Anthropic/Claude calls
+    check_claude_stream_limit(request, body.model_provider)
+
     doc_context = ""
     if body.document_ids:
         doc_context = await get_document_context(body.document_ids)
